@@ -147,7 +147,7 @@ def build_prompt(item):
 escribiendo para el sitio argentino tecno.ar.
 
 Con base en la siguiente informacion de una fuente de autoridad, redacta una
-nota periodistica original en espanol rioplatense, de entre 350 y 500 palabras.
+nota periodistica original en espanol, de entre 600 y 800 palabras.
 
 Titulo original: {item['title']}
 Fuente: {item['source']}
