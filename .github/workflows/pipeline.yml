@@ -2,9 +2,9 @@ name: Pipeline de contenido tecno.ar
 
 on:
   schedule:
-    # Corre 2 veces al dia (08:00 y 18:00 UTC). Ajusta a gusto.
-    - cron: "0 8,18 * * *"
-  workflow_dispatch: {}  # permite tambien correrlo manualmente desde GitHub
+    # Corre a las 14:00 y 18:00 hora Argentina (UTC-3) -> 17 y 21 UTC
+    - cron: "0 17,21 * * *"
+  workflow_dispatch: {}  # permite ejecución manual
 
 jobs:
   generar-borradores:
