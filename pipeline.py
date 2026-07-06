@@ -3,20 +3,7 @@
 Pipeline de automatizacion para tecno.ar
 ==========================================
 Flujo: RSS -> deduplicacion -> filtro rapido por reglas -> filtro IA (Gemini)
-       -> redaccion con Gemini -> borrador para revision humana
-
-Requisitos:
-    pip install feedparser requests google-genai --break-system-packages
-
-Variables de entorno necesarias:
-    GEMINI_API_KEY   -> obtenida gratis en https://aistudio.google.com/apikey
-
-Uso:
-    python pipeline.py
-
-Salida:
-    - drafts/YYYY-MM-DD_slug.md  (borrador por noticia, listo para revisar)
-    - seen.json                  (registro de items ya procesados)
+       -> redaccion con Gemini -> borrador local -> publicador WordPress
 """
 
 import feedparser
@@ -26,9 +13,11 @@ import os
 import re
 import time
 import hashlib
+import subprocess
+import sys
 from pathlib import Path
 from datetime import datetime
-from google import genai  # <--- NUEVA DEPENDENCIA para Gemini
+from google import genai
 
 # ----------------------------------------------------------------------
 # CONFIGURACION
@@ -40,7 +29,7 @@ SEEN_FILE = BASE_DIR / "seen.json"
 DRAFTS_DIR = BASE_DIR / "drafts"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"  # modelo del tier gratuito
+GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -49,7 +38,6 @@ GEMINI_URL = (
 MAX_ITEMS_PER_RUN = 8
 MIN_SOURCES_PER_TOPIC = 1
 
-# Palabras clave para filtro inicial (rápido)
 KEYWORDS = [
     "inteligencia artificial", "ai", "ciberseguridad", "seguridad informatica",
     "software", "hardware", "app", "smartphone", "google", "microsoft",
@@ -89,7 +77,7 @@ def slugify(text):
     return re.sub(r"[\s_-]+", "-", text).strip("-")[:60]
 
 # ----------------------------------------------------------------------
-# SISTEMA DE SCORING POR REGLAS (EQUITATIVO, SIN SESGO EXAGERADO)
+# SISTEMA DE SCORING POR REGLAS (EQUITATIVO)
 # ----------------------------------------------------------------------
 
 LAUNCH_KEYWORDS = [
@@ -124,52 +112,39 @@ PENALTY_KEYWORDS = [
 ]
 
 def compute_relevance_score(entry_text):
-    """
-    Filtro rápido: devuelve un score de 0 a 10 usando reglas.
-    Ahora es EQUITATIVO: Argentina solo suma +1 si es lanzamiento.
-    """
     text = entry_text.lower()
     is_launch = any(kw in text for kw in LAUNCH_KEYWORDS)
 
-    score = 1  # base
+    score = 1
     categorias = []
 
-    # Hardware
     if any(kw in text for kw in HARDWARE_KEYWORDS):
         score += 3
         if is_launch:
             score += 2
         categorias.append("hardware")
 
-    # IA
     if any(kw in text for kw in AI_KEYWORDS):
         score += 3
         if is_launch:
             score += 2
         categorias.append("ia")
 
-    # Argentina (bonus simbólico de +1 SOLO si es lanzamiento)
     if is_launch and any(kw in text for kw in ARGENTINA_KEYWORDS):
         score += 1
         categorias.append("argentina")
 
-    # Penalizaciones
     if any(kw in text for kw in PENALTY_KEYWORDS):
         score -= 2
 
     return max(0, min(10, score)), (categorias[0] if categorias else "general")
 
 # ----------------------------------------------------------------------
-# FILTRO CON GEMINI (IA) – NUEVO
+# FILTRO CON GEMINI (IA)
 # ----------------------------------------------------------------------
 
 def score_news_with_gemini(candidatos):
-    """
-    Envía una lista de noticias a Gemini para que las puntúe y categorice.
-    Retorna la misma lista con los campos 'score_ia' y 'categoria_ia'.
-    """
     if not candidatos or not GEMINI_API_KEY:
-        # Si no hay API key, devolvemos los mismos con score bajo para no romper
         for item in candidatos:
             item['score_ia'] = 1
             item['categoria_ia'] = 'general'
@@ -177,7 +152,6 @@ def score_news_with_gemini(candidatos):
 
     client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # Construir prompt con ejemplos (few-shot) y las noticias a evaluar
     prompt = """Eres un editor jefe de tecnología. Evalúa cada noticia con un score del 1 al 10 (10 = excelente) y una categoría: "hardware", "ia", "argentina", o "general".
 
 Ejemplos:
@@ -203,7 +177,7 @@ Noticias:
 
     try:
         response = client.models.generate_content(
-            model="gemini-2.0-flash",  # modelo rápido y gratuito
+            model="gemini-2.0-flash",
             contents=prompt,
             config={
                 "response_mime_type": "application/json",
@@ -214,7 +188,6 @@ Noticias:
         data = json.loads(response.text)
         resultados = data.get("resultados", [])
 
-        # Asignar scores a cada candidato
         for item in candidatos:
             item['score_ia'] = 1
             item['categoria_ia'] = 'general'
@@ -226,7 +199,6 @@ Noticias:
 
     except Exception as e:
         print(f"⚠️ Error en Gemini (scoring): {e}")
-        # Fallback: asignar score 1 a todos
         for item in candidatos:
             item['score_ia'] = 1
             item['categoria_ia'] = 'general'
@@ -234,16 +206,15 @@ Noticias:
     return candidatos
 
 # ----------------------------------------------------------------------
-# PASO 1: INGESTA + DEDUPLICACION + FILTRO RÁPIDO + FILTRO IA
+# PASO 1: INGESTA + FILTROS
 # ----------------------------------------------------------------------
 
-MAX_POR_FUENTE = max(2, MAX_ITEMS_PER_RUN // 3)  # tope de equidad por fuente (se mantiene)
+MAX_POR_FUENTE = max(2, MAX_ITEMS_PER_RUN // 3)
 
 def fetch_new_relevant_items():
     seen = load_seen()
     candidatos = []
 
-    # 1. Obtener noticias de todos los feeds
     for url in load_feeds():
         try:
             feed = feedparser.parse(url)
@@ -263,7 +234,6 @@ def fetch_new_relevant_items():
             texto_completo = entry.get("title", "") + " " + entry.get("summary", "")
             score_reglas, categoria_reglas = compute_relevance_score(texto_completo)
 
-            # Filtro rápido: solo pasan los que tienen al menos 3 puntos en reglas
             if score_reglas < 3:
                 continue
 
@@ -276,7 +246,6 @@ def fetch_new_relevant_items():
                 "published": entry.get("published", ""),
                 "score_reglas": score_reglas,
                 "categoria_reglas": categoria_reglas,
-                # Estos los llenará Gemini después
                 "score_ia": 0,
                 "categoria_ia": "general",
             })
@@ -286,20 +255,15 @@ def fetch_new_relevant_items():
     if not candidatos:
         return []
 
-    # 2. Limitar a 30 para no saturar el contexto de Gemini
     if len(candidatos) > 30:
-        # Ordenar por score_reglas y tomar los 30 mejores
         candidatos.sort(key=lambda x: x["score_reglas"], reverse=True)
         candidatos = candidatos[:30]
         print("🔪 Limitando a 30 noticias para enviar a Gemini.")
 
-    # 3. Filtro con Gemini (scoring por IA)
     candidatos_con_score = score_news_with_gemini(candidatos)
 
-    # 4. Ordenar por score_ia (mayor a menor)
     candidatos_con_score.sort(key=lambda x: x.get("score_ia", 0), reverse=True)
 
-    # 5. Seleccionar los mejores (hasta MAX_ITEMS_PER_RUN) con tope por fuente
     seleccionados = []
     conteo_por_fuente = {}
 
@@ -312,12 +276,10 @@ def fetch_new_relevant_items():
 
         seleccionados.append(item)
         conteo_por_fuente[fuente] = conteo_por_fuente.get(fuente, 0) + 1
-        # Guardar en seen (marcar como procesado)
         seen[item["hash"]] = {"title": item["title"], "date": datetime.now().isoformat()}
 
     save_seen(seen)
 
-    # Mostrar resultados
     print("\n🏆 NOTICIAS SELECCIONADAS POR GEMINI:")
     for it in seleccionados:
         print(f"  [{it.get('score_ia', 0):>2}pts | {it.get('categoria_ia', 'general'):<9}] {it['title'][:70]}")
@@ -325,14 +287,10 @@ def fetch_new_relevant_items():
     return seleccionados
 
 # ----------------------------------------------------------------------
-# PASO 2: REDACCION CON GEMINI (tu lógica original, intacta)
+# PASO 2: REDACCION CON GEMINI
 # ----------------------------------------------------------------------
 
 def build_prompt(item):
-    """
-    Prompt disenado para maximizar el SEO Score de Rank Math (apuntando a 85+),
-    sin sacrificar calidad editorial real ni caer en keyword stuffing.
-    """
     return f"""Actua como un redactor SEO senior especializado en tecnologia,
 con dominio experto de los criterios de puntuacion de Rank Math para WordPress,
 escribiendo para el sitio argentino tecno.ar.
@@ -451,7 +409,7 @@ def call_gemini(prompt, retries=3):
     raise RuntimeError("Se agotaron los reintentos por rate limit (429).")
 
 # ----------------------------------------------------------------------
-# PASO 3: GUARDAR BORRADOR
+# PASO 3: GUARDAR BORRADOR LOCAL
 # ----------------------------------------------------------------------
 
 def save_draft(item, article_md):
@@ -468,14 +426,11 @@ def save_draft(item, article_md):
         f"-->\n\n"
     )
     path.write_text(header + article_md, encoding="utf-8")
-    print(f"[OK] Borrador guardado: {path}")
+    print(f"[OK] Borrador guardado localmente: {path}")
+    return path
 
 # ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
-
-# ----------------------------------------------------------------------
-# MAIN (VERSIÓN CORREGIDA CON WORDPRESS)
+# MAIN (INTEGRADO CON WORDPRESS)
 # ----------------------------------------------------------------------
 
 def main():
@@ -483,35 +438,33 @@ def main():
     items = fetch_new_relevant_items()
     print(f"Encontrados {len(items)} items nuevos para procesar.")
 
-    # Intentar importar la función de publicación de WordPress
-    try:
-        from publish_to_wordpress import generate_and_publish
-        tiene_wp = True
-    except ImportError:
-        print("⚠️ No se encontró 'publish_to_wordpress'. Los borradores se guardarán LOCALMENTE.")
-        tiene_wp = False
-
+    # Generar borradores locales para cada noticia seleccionada
     for item in items:
         print(f"\nRedactando: {item['title'][:70]}...")
         try:
             prompt = build_prompt(item)
             article = call_gemini(prompt)
-
-            # --- Publicar en WordPress (si existe) ---
-            if tiene_wp:
-                try:
-                    generate_and_publish(item, article)
-                    print(f"✅ Borrador subido a WordPress: {item['title'][:50]}...")
-                except Exception as wp_err:
-                    print(f"⚠️ Error al subir a WP, guardando local: {wp_err}")
-                    save_draft(item, article)  # Fallback local
-            else:
-                # Si no hay WP, guardamos local como siempre
-                save_draft(item, article)
-
+            save_draft(item, article)
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
-        time.sleep(4)  # respeta el limite de RPM del free tier
+        time.sleep(4)
+
+    # Una vez generados todos los borradores, ejecutar el publicador de WordPress
+    print("\n📤 Subiendo borradores a WordPress...")
+    try:
+        # Ejecutar publish_to_wordpress.py como un subproceso
+        result = subprocess.run(
+            [sys.executable, str(BASE_DIR / "publish_to_wordpress.py")],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        print(result.stdout)
+        if result.stderr:
+            print("⚠️ Errores del publicador:")
+            print(result.stderr)
+    except Exception as e:
+        print(f"⚠️ Error al ejecutar el publicador: {e}")
 
     print("\n✅ Pipeline finalizado.")
 
