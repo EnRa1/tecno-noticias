@@ -5,7 +5,7 @@ https://www.wired.com/feed/rss
 https://www.infobae.com/tecno/rss/
 https://www.ambito.com/rss/pages/tecnologia.xml
 https://www.clarin.com/rss/tecnologia/
-https://www.perfil.com/feed/tecnologia
+
 
 
 # Blogs oficiales de empresas (fuentes primarias)
