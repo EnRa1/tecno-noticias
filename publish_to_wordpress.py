@@ -1,4 +1,5 @@
 """
+si
 Publicador a WordPress para tecno.ar
 ======================================
 Toma los borradores generados por pipeline.py (carpeta drafts/), los parsea,
