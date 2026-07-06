@@ -1,10 +1,12 @@
 name: Pipeline de contenido tecno.ar
 
+permissions: write-all
+
 on:
   schedule:
-    # Corre a las 14:00 y 18:00 hora Argentina (UTC-3) -> 17 y 21 UTC
-    - cron: "0 17,21 * * *"
-  workflow_dispatch: {}  # permite ejecución manual
+    - cron: "50 17 * * *"
+    - cron: "15 21 * * *"
+  workflow_dispatch: {}
 
 jobs:
   generar-borradores:
