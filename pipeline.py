@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 2.0)
-=====================================================
-1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
-2. Filtro contextual con Gemini (1 sola llamada) -> elige las 8 mejores por contexto
-3. Redaccion con Gemini (1 llamada por noticia seleccionada)
+Pipeline de automatización para tecno.ar (Hybrid 2.0)
+Diccionarios completos y expansivos para capturar todo el espectro tecnológico.
 """
 
 import feedparser
@@ -18,7 +15,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 # ----------------------------------------------------------------------
-# CONFIGURACION
+# CONFIGURACIÓN
 # ----------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).parent
@@ -27,7 +24,7 @@ SEEN_FILE = BASE_DIR / "seen.json"
 DRAFTS_DIR = BASE_DIR / "drafts"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"  # Usa el modelo mas potente para entender contexto
+GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -36,16 +33,162 @@ GEMINI_URL = (
 MAX_ITEMS_PER_RUN = 8
 MAX_HOURS_OLD = 24
 
-# Palabras clave para el filtro rapido (barrera de entrada)
+# ======================================================================
+# DICCIONARIOS COMPLETOS Y EXPANSIVOS
+# ======================================================================
+
+# ----------------------------------------------------------------------
+# 1. FILTRO DE RELEVANCIA GENERAL (KEYWORDS)
+#    - Palabras que indican que la noticia es de tecnología.
+#    - Debe ser amplio para no descartar nada relevante.
+# ----------------------------------------------------------------------
 KEYWORDS = [
-    "inteligencia artificial", "ai", "ciberseguridad", "seguridad informatica",
-    "software", "hardware", "app", "smartphone", "google", "microsoft",
-    "apple", "startup", "tecnologia", "internet", "nube", "cloud",
+    # Inteligencia Artificial
+    "inteligencia artificial", "ai", "machine learning", "deep learning",
+    "red neuronal", "llm", "gpt", "chatgpt", "gemini", "claude", "copilot",
+    "modelo de lenguaje", "ia generativa", "stable diffusion", "midjourney",
+    "dalle", "openai", "anthropic", "deepmind", "hugging face",
+
+    # Ciberseguridad
+    "ciberseguridad", "seguridad informatica", "hacker", "ransomware",
+    "malware", "virus", "phishing", "zero-day", "vulnerabilidad",
+    "firewall", "encriptacion", "privacidad", "filtracion", "data breach",
+    "ciberataque", "autenticacion", "biometria",
+
+    # Hardware y electrónica
+    "hardware", "procesador", "chip", "cpu", "gpu", "nvidia", "amd", "intel",
+    "apple silicon", "ryzen", "core ultra", "snapdragon", "mediatek",
+    "semiconductor", "tsmc", "ram", "ddr5", "ssd", "almacenamiento",
+    "monitor", "pantalla", "oled", "microled", "arm", "risc-v",
+    "smartphone", "celular", "iphone", "samsung", "galaxy", "pixel",
+    "xiaomi", "huawei", "fold", "flip", "plegable", "tablet", "ipad",
+    "notebook", "laptop", "ultrabook", "smartwatch", "wearable",
+    "auriculares", "airpods", "consola", "playstation", "xbox", "nintendo",
+    "switch", "ps5", "game pass", "steam", "tarjeta grafica",
+    "periferico", "teclado", "mouse", "smart tv", "televisor",
+    "auto electrico", "vehiculo electrico", "ev", "bateria", "grafeno",
+
+    # Software y sistemas operativos
+    "software", "app", "aplicacion", "windows", "linux", "ubuntu", "macos",
+    "ios", "android", "chrome os", "actualizacion", "parche", "bug",
+    "microsoft", "apple", "google", "beta", "open source", "codigo abierto",
+    "git", "github", "software libre", "framework", "api", "backend",
+    "frontend", "devops", "microservicios", "contenedores", "docker",
+    "kubernetes", "cloud", "nube", "aws", "azure", "gcp", "oracle",
+
+    # Internet, Web y comunicaciones
+    "internet", "web", "navegador", "chrome", "firefox", "safari", "edge",
+    "5g", "wifi", "fibra optica", "starlink", "satelite", "telecomunicaciones",
+    "redes", "protocolo", "tcp/ip", "dns", "cdn", "streaming", "netflix",
+    "spotify", "youtube", "twitch", "podcast", "online", "digital",
+
+    # Tecnología emergente y ciencia
+    "metaverso", "realidad virtual", "realidad aumentada", "vr", "ar",
+    "blockchain", "web3", "cripto", "bitcoin", "ethereum", "nft",
+    "robot", "robotica", "dron", "automatizacion", "iot", "internet de las cosas",
+    "smart home", "hogar inteligente", "asistente virtual", "siri", "alexa",
+    "espacio", "nasa", "spacex", "starship", "ciencia", "investigacion",
+    "descubrimiento", "fisica", "cuantico", "biotecnologia", "salud",
+    "innovacion", "tecnologia", "tecnológico", "digital", "electrónico",
+    "gadget", "dispositivo", "sensor", "wearable", "impresion 3d",
+
+    # Negocios, startups y economía digital
+    "startup", "emprendimiento", "inversion", "financiacion", "unicornio",
+    "mercado", "acciones", "nasdaq", "tesla", "spacex", "amazon", "meta",
+    "alphabet", "oracle", "salesforce", "uber", "mercado libre",
+    "globant", "despegar", "tiendanube", "auth0", "satellogic",
+    "economia digital", "fintech", "ecommerce", "comercio electronico",
 ]
 
 # ----------------------------------------------------------------------
-# UTILIDADES
+# 2. PALABRAS CLAVE DE HARDWARE (para puntuación)
 # ----------------------------------------------------------------------
+HARDWARE_KEYWORDS = [
+    # Procesadores y chips
+    "procesador", "chip", "cpu", "gpu", "nvidia", "amd", "intel",
+    "apple silicon", "ryzen", "core ultra", "snapdragon", "mediatek",
+    "semiconductor", "tsmc", "arm", "risc-v",
+
+    # Componentes
+    "ram", "ddr5", "ssd", "almacenamiento", "monitor", "pantalla",
+    "oled", "microled", "tarjeta grafica", "placa de video", "motherboard",
+    "placa madre", "disco duro", "hdd", "fuente de poder", "cooler",
+    "ventilador", "gabinete", "mouse", "teclado", "auriculares",
+
+    # Dispositivos móviles
+    "smartphone", "celular", "iphone", "samsung", "galaxy", "pixel",
+    "xiaomi", "huawei", "oneplus", "oppo", "vivo", "realme", "motorola",
+    "fold", "flip", "plegable", "tablet", "ipad", "smartwatch", "wearable",
+
+    # Laptops y PCs
+    "notebook", "laptop", "ultrabook", "chromebook", "surface", "macbook",
+    "pc", "computadora", "escritorio", "all-in-one", "mini pc", "workstation",
+
+    # Gaming
+    "consola", "playstation", "ps5", "ps4", "xbox", "nintendo", "switch",
+    "steam", "xbox game pass", "psn", "joystick", "control", "gaming",
+
+    # Televisores y audio
+    "smart tv", "televisor", "oled", "qled", "microled", "samsung tv",
+    "sony tv", "lg tv", "home theater", "soundbar", "bocina", "altavoz",
+
+    # Automoción y energía
+    "auto electrico", "vehiculo electrico", "ev", "tesla", "bateria",
+    "grafeno", "litio", "carga rapida", "autonomia", "conduccion autonoma",
+]
+
+# ----------------------------------------------------------------------
+# 3. PALABRAS CLAVE DE IA
+# ----------------------------------------------------------------------
+AI_KEYWORDS = [
+    "inteligencia artificial", "modelo de ia", "llm", "chatgpt", "gemini",
+    "claude", "openai", "anthropic", "copilot", "gpt-", "modelo de lenguaje",
+    "machine learning", "deep learning", "red neuronal", "redes neuronales",
+    "ai", "ml", "dl", "nlp", "procesamiento de lenguaje natural",
+    "visión por computadora", "computer vision", "reconocimiento facial",
+    "generación de texto", "generación de imágenes", "stable diffusion",
+    "midjourney", "dalle", "hugging face", "transformers", "bert",
+    "tensorflow", "pytorch", "keras", "ia generativa", "agentes ia",
+    "autogpt", "ai agents", "seguridad ia", "etica ia", "regulacion ia",
+]
+
+# ----------------------------------------------------------------------
+# 4. PALABRAS CLAVE DE ARGENTINA (y tecnología local)
+# ----------------------------------------------------------------------
+ARGENTINA_KEYWORDS = [
+    "argentina", "argentino", "argentina tech", "buenos aires",
+    "mercado libre", "mercadolibre", "globant", "ualá", "uala",
+    "satellogic", "auth0", "despegar", "tiendanube", "meli",
+    "argentine", "startup argentina", "unicornio argentino",
+    "ecosistema tech argentino", "programadores argentinos",
+    "desarrolladores argentinos", "software argentino", "hardware argentino",
+    "ciencia argentina", "tecnologia argentina", "innovacion argentina",
+]
+
+# ----------------------------------------------------------------------
+# 5. PALABRAS CLAVE DE LANZAMIENTOS
+# ----------------------------------------------------------------------
+LAUNCH_KEYWORDS = [
+    "lanza", "lanzamiento", "presenta", "presento", "anuncia", "anuncio",
+    "debuta", "revela", "sale a la venta", "disponible desde", "estrena",
+    "launches", "unveils", "announces", "introduces", "debuts", "reveals",
+    "nuevo modelo", "nueva version", "nuevo producto", "ahora disponible",
+    "ya disponible", "preventa", "reserva", "llegada", "arribo",
+]
+
+# ----------------------------------------------------------------------
+# 6. PALABRAS DE PENALIZACIÓN (clickbait, contenido vacío)
+# ----------------------------------------------------------------------
+PENALTY_KEYWORDS = [
+    "lo que tenés que saber", "imperdible", "no te pierdas", "resumen del día",
+    "lo mejor de", "top 5", "top 10", "los mejores", "los peores",
+    "opinión", "análisis subjetivo", "por qué", "vale la pena",
+    "guía definitiva", "tutorial completo", "paso a paso",
+]
+
+# ======================================================================
+# FUNCIONES DEL SISTEMA
+# ======================================================================
 
 def load_feeds():
     urls = []
@@ -75,10 +218,6 @@ def slugify(text):
     text = re.sub(r"[^\w\s-]", "", text.lower())
     return re.sub(r"[\s_-]+", "-", text).strip("-")[:60]
 
-# ----------------------------------------------------------------------
-# FILTRO POR FECHA
-# ----------------------------------------------------------------------
-
 def is_recent(entry, max_hours=MAX_HOURS_OLD):
     published_parsed = entry.get('published_parsed') or entry.get('updated_parsed')
     if not published_parsed:
@@ -89,41 +228,6 @@ def is_recent(entry, max_hours=MAX_HOURS_OLD):
     if diff.total_seconds() < 0:
         return True
     return diff.total_seconds() <= max_hours * 3600
-
-# ----------------------------------------------------------------------
-# SISTEMA DE SCORING POR REGLAS (SOLO PARA PREFILTRAR)
-# ----------------------------------------------------------------------
-
-LAUNCH_KEYWORDS = [
-    "lanza", "lanzamiento", "presenta", "presento", "anuncia", "anuncio",
-    "debuta", "revela", "sale a la venta", "disponible desde", "estrena",
-    "launches", "unveils", "announces", "introduces", "debuts", "reveals",
-]
-
-HARDWARE_KEYWORDS = [
-    "smartphone", "celular", "iphone", "procesador", "chip", "cpu", "gpu",
-    "tarjeta grafica", "periferico", "teclado", "mouse", "auriculares",
-    "smart tv", "televisor", "auto electrico", "vehiculo electrico", "ev",
-    "tablet", "notebook", "laptop", "smartwatch", "wearable", "consola",
-    "placa de video", "motherboard", "placa madre", "bateria", "grafeno",
-]
-
-ARGENTINA_KEYWORDS = [
-    "argentina", "argentino", "buenos aires",
-    "mercado libre", "mercadolibre", "globant", "uala", "ualá",
-    "satellogic", "auth0", "despegar", "tiendanube",
-]
-
-AI_KEYWORDS = [
-    "inteligencia artificial", "modelo de ia", "llm", "chatgpt", "gemini",
-    "claude", "openai", "anthropic", "copilot", "gpt-", "modelo de lenguaje",
-    "machine learning", "deep learning", "red neuronal"
-]
-
-PENALTY_KEYWORDS = [
-    "lo que tenés que saber", "imperdible", "no te pierdas", "resumen del día",
-    "lo mejor de", "top 5", "top 10"
-]
 
 def compute_relevance_score(entry_text):
     text = entry_text.lower()
@@ -153,17 +257,8 @@ def compute_relevance_score(entry_text):
 
     return max(0, min(10, score)), (categorias[0] if categorias else "general")
 
-# ----------------------------------------------------------------------
-# NUEVO: FILTRO CONTEXTUAL CON GEMINI (1 SOLA LLAMADA)
-# ----------------------------------------------------------------------
-
 def rank_with_gemini(candidatos):
-    """
-    Envia TODOS los candidatos (max 30) en UNA sola llamada a Gemini.
-    Gemini devuelve los indices de los 8 mejores segun contexto real.
-    """
     if not candidatos or len(candidatos) <= MAX_ITEMS_PER_RUN:
-        # Si ya son pocos, no hace falta IA, los devolvemos todos.
         return candidatos
 
     if not GEMINI_API_KEY:
@@ -172,7 +267,6 @@ def rank_with_gemini(candidatos):
 
     print(f"🧠 Enviando {len(candidatos)} noticias a Gemini para ranking contextual (1 sola llamada)...")
 
-    # Construir la lista para el prompt
     lista_texto = ""
     for idx, item in enumerate(candidatos, 1):
         lista_texto += f"{idx}. Título: {item['title']}\n   Resumen: {item['summary'][:250]}\n\n"
@@ -186,7 +280,10 @@ def rank_with_gemini(candidatos):
     2. **Avances reales en Inteligencia Artificial** (nuevos modelos, aplicaciones prácticas, regulaciones).
     3. **Tecnología argentina** o que impacte directamente en Argentina (Mercado Libre, startups locales, leyes).
     4. **Ciberseguridad** (ataques reales, vulnerabilidades críticas).
-    5. Ignora artículos de opinión, análisis retrospectivos ("Por qué X fracasó"), o rumores sin fuentes concretas.
+    5. **Ciencia y tecnología** (descubrimientos, avances espaciales, biotecnología).
+    6. **Economía digital y startups** (financiaciones, adquisiciones, nuevas empresas).
+    7. Ignora artículos de opinión, análisis retrospectivos ("Por qué X fracasó"), o rumores sin fuentes concretas.
+    8. Ignora tutoriales, guías, "cómo hacer", o contenido educativo básico.
 
     Lista de noticias:
     {lista_texto}
@@ -215,9 +312,7 @@ def rank_with_gemini(candidatos):
                 print("⚠️ Gemini no devolvió índices, usando orden por reglas.")
                 return candidatos
 
-            # Filtrar los candidatos seleccionados (respetando el orden de Gemini)
             seleccionados = []
-            # Asegurarnos de que los indices son válidos (1-based)
             for i in indices:
                 if 1 <= i <= len(candidatos):
                     seleccionados.append(candidatos[i-1])
@@ -233,17 +328,12 @@ def rank_with_gemini(candidatos):
         print(f"⚠️ Excepción en Gemini (ranking): {e}, usando orden por reglas.")
         return candidatos
 
-# ----------------------------------------------------------------------
-# INGESTA + FILTROS
-# ----------------------------------------------------------------------
-
 MAX_POR_FUENTE = max(2, MAX_ITEMS_PER_RUN // 3)
 
 def fetch_new_relevant_items():
     seen = load_seen()
     candidatos = []
 
-    # --- PASO 1: OBTENER Y FILTRAR POR REGLAS (GRATIS) ---
     for url in load_feeds():
         try:
             feed = feedparser.parse(url)
@@ -266,7 +356,6 @@ def fetch_new_relevant_items():
             texto_completo = entry.get("title", "") + " " + entry.get("summary", "")
             score_reglas, categoria_reglas = compute_relevance_score(texto_completo)
 
-            # Filtro agresivo: solo pasan los que tienen al menos 3 puntos (barrera baja)
             if score_reglas < 3:
                 continue
 
@@ -286,22 +375,16 @@ def fetch_new_relevant_items():
     if not candidatos:
         return []
 
-    # Limitar a 30 para no saturar el prompt de Gemini
     if len(candidatos) > 30:
-        # Ordenar por score_reglas y tomar los 30 mejores (para darle a Gemini lo mas potable)
         candidatos.sort(key=lambda x: x["score_reglas"], reverse=True)
         candidatos = candidatos[:30]
         print("🔪 Limitando a 30 para el ranking contextual.")
 
-    # --- PASO 2: RANKING CONTEXTUAL CON GEMINI (1 SOLA LLAMADA) ---
-    # Si hay menos de 8 noticias, no usamos IA, las mandamos todas.
     if len(candidatos) > MAX_ITEMS_PER_RUN:
         seleccionados_por_ia = rank_with_gemini(candidatos)
     else:
         seleccionados_por_ia = candidatos
 
-    # --- PASO 3: APLICAR TOPE POR FUENTE (EQUIDAD) ---
-    # Esto evita que una sola fuente (ej: Xataka) se lleve todos los puestos
     seleccionados_final = []
     conteo_por_fuente = {}
 
@@ -325,7 +408,7 @@ def fetch_new_relevant_items():
     return seleccionados_final
 
 # ----------------------------------------------------------------------
-# REDACCION CON GEMINI (TU LOGICA ORIGINAL)
+# REDACCION Y PUBLICACION (sin cambios)
 # ----------------------------------------------------------------------
 
 def build_prompt(item):
@@ -437,10 +520,6 @@ def call_gemini(prompt, retries=3):
 
     raise RuntimeError("Se agotaron los reintentos por rate limit (429).")
 
-# ----------------------------------------------------------------------
-# GUARDAR BORRADOR LOCAL
-# ----------------------------------------------------------------------
-
 def save_draft(item, article_md):
     DRAFTS_DIR.mkdir(exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -457,12 +536,8 @@ def save_draft(item, article_md):
     path.write_text(header + article_md, encoding="utf-8")
     print(f"[OK] Borrador guardado localmente: {path}")
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
-
 def main():
-    print("🚀 Iniciando pipeline Hybrid 2.0 (Reglas + 1 llamada a Gemini para contexto)...")
+    print("🚀 Iniciando pipeline Hybrid 2.0 con diccionarios completos...")
     items = fetch_new_relevant_items()
     print(f"Encontrados {len(items)} items nuevos para procesar.")
 
