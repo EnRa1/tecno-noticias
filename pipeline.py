@@ -3,7 +3,9 @@
 Pipeline de automatizacion para tecno.ar
 ==========================================
 Flujo: RSS -> deduplicacion -> filtro rapido por reglas -> filtro IA (Gemini)
-       -> redaccion con Gemini -> borrador local -> publicador WordPress
+       -> redaccion con Gemini -> borrador -> WordPress (o local)
+
+Novedad: filtro por antigüedad (solo noticias de las últimas 24 horas)
 """
 
 import feedparser
@@ -13,10 +15,8 @@ import os
 import re
 import time
 import hashlib
-import subprocess
-import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from google import genai
 
 # ----------------------------------------------------------------------
@@ -37,6 +37,7 @@ GEMINI_URL = (
 
 MAX_ITEMS_PER_RUN = 8
 MIN_SOURCES_PER_TOPIC = 1
+MAX_HOURS_OLD = 24  # <--- NUEVO: solo noticias de las últimas 24 horas
 
 KEYWORDS = [
     "inteligencia artificial", "ai", "ciberseguridad", "seguridad informatica",
@@ -75,6 +76,37 @@ def is_relevant(entry):
 def slugify(text):
     text = re.sub(r"[^\w\s-]", "", text.lower())
     return re.sub(r"[\s_-]+", "-", text).strip("-")[:60]
+
+# ----------------------------------------------------------------------
+# FILTRO POR FECHA (NUEVO)
+# ----------------------------------------------------------------------
+
+def is_recent(entry, max_hours=MAX_HOURS_OLD):
+    """
+    Verifica si la noticia fue publicada en las últimas 'max_hours' horas.
+    Retorna True si es reciente, False si es vieja o no se pudo determinar.
+    """
+    # Intentar obtener la fecha de publicación
+    published_parsed = entry.get('published_parsed')
+    if not published_parsed:
+        # Algunos feeds usan 'updated_parsed'
+        published_parsed = entry.get('updated_parsed')
+    
+    if not published_parsed:
+        # Si no hay fecha, asumimos que es reciente (para no perder noticias)
+        print(f"⚠️ Noticia sin fecha: {entry.get('title', 'Sin título')[:50]}... - Se asume reciente")
+        return True
+    
+    # Convertir struct_time a datetime (UTC)
+    pub_date = datetime.fromtimestamp(time.mktime(published_parsed), tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    diff = now - pub_date
+    
+    if diff.total_seconds() < 0:
+        # Fecha futura (raro) -> la consideramos reciente
+        return True
+    
+    return diff.total_seconds() <= max_hours * 3600
 
 # ----------------------------------------------------------------------
 # SISTEMA DE SCORING POR REGLAS (EQUITATIVO)
@@ -228,6 +260,13 @@ def fetch_new_relevant_items():
             h = item_hash(entry)
             if h in seen:
                 continue
+
+            # --- NUEVO FILTRO POR FECHA ---
+            if not is_recent(entry, MAX_HOURS_OLD):
+                # Opcional: mostrar un mensaje de depuración
+                # print(f"⏭️ Descartado por antigüedad: {entry.get('title', '')[:50]}...")
+                continue
+
             if not is_relevant(entry):
                 continue
 
@@ -427,44 +466,44 @@ def save_draft(item, article_md):
     )
     path.write_text(header + article_md, encoding="utf-8")
     print(f"[OK] Borrador guardado localmente: {path}")
-    return path
 
 # ----------------------------------------------------------------------
-# MAIN (INTEGRADO CON WORDPRESS)
+# MAIN (CON WORDPRESS)
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline con filtro IA (Gemini)...")
+    print("🚀 Iniciando pipeline con filtro IA (Gemini) y filtro temporal...")
     items = fetch_new_relevant_items()
     print(f"Encontrados {len(items)} items nuevos para procesar.")
 
-    # Generar borradores locales para cada noticia seleccionada
+    # Intentar importar la función de WordPress
+    try:
+        from publish_to_wordpress import generate_and_publish
+        tiene_wp = True
+        print("✅ Integración con WordPress activada.")
+    except ImportError:
+        print("⚠️ No se encontró 'publish_to_wordpress'. Los borradores se guardarán LOCALMENTE.")
+        tiene_wp = False
+
     for item in items:
         print(f"\nRedactando: {item['title'][:70]}...")
         try:
             prompt = build_prompt(item)
             article = call_gemini(prompt)
-            save_draft(item, article)
+
+            if tiene_wp:
+                try:
+                    generate_and_publish(item, article)
+                    print(f"✅ Borrador subido a WordPress: {item['title'][:50]}...")
+                except Exception as wp_err:
+                    print(f"⚠️ Error al subir a WP, guardando local: {wp_err}")
+                    save_draft(item, article)
+            else:
+                save_draft(item, article)
+
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
         time.sleep(4)
-
-    # Una vez generados todos los borradores, ejecutar el publicador de WordPress
-    print("\n📤 Subiendo borradores a WordPress...")
-    try:
-        # Ejecutar publish_to_wordpress.py como un subproceso
-        result = subprocess.run(
-            [sys.executable, str(BASE_DIR / "publish_to_wordpress.py")],
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        print(result.stdout)
-        if result.stderr:
-            print("⚠️ Errores del publicador:")
-            print(result.stderr)
-    except Exception as e:
-        print(f"⚠️ Error al ejecutar el publicador: {e}")
 
     print("\n✅ Pipeline finalizado.")
 
