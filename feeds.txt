@@ -1,8 +1,12 @@
 # Fuentes internacionales de autoridad
 https://techcrunch.com/feed/
 https://www.theverge.com/rss/index.xml
-https://feeds.arstechnica.com/arstechnica/index
 https://www.wired.com/feed/rss
+https://www.infobae.com/tecno/rss/
+https://www.ambito.com/rss/pages/tecnologia.xml
+https://www.clarin.com/rss/tecnologia/
+https://www.perfil.com/feed/tecnologia
+
 
 # Blogs oficiales de empresas (fuentes primarias)
 https://blog.google/rss/
@@ -15,7 +19,7 @@ https://www.genbeta.com/feedburner.xml
 https://hipertextual.com/feed
 
 # Argentina
-https://www.infobae.com/tecno/rss/
+
 
 # Nota: agregá o quitá según la línea editorial real de tecno.ar.
 # Revisá periódicamente que cada URL siga activa (los medios cambian su RSS sin avisar).
