@@ -103,8 +103,10 @@ def slugify(text):
 
 def fetch_new_relevant_items():
     seen = load_seen()
-    new_items = []
 
+    # Primero juntamos los candidatos relevantes de CADA fuente por separado,
+    # sin mezclarlos todavia. Asi ninguna fuente "se come" el cupo de las demas.
+    items_by_source = []
     for url in load_feeds():
         try:
             feed = feedparser.parse(url)
@@ -112,6 +114,7 @@ def fetch_new_relevant_items():
             print(f"[WARN] No se pudo leer {url}: {e}")
             continue
 
+        source_items = []
         for entry in feed.entries:
             h = item_hash(entry)
             if h in seen:
@@ -119,7 +122,7 @@ def fetch_new_relevant_items():
             if not is_relevant(entry):
                 continue
 
-            new_items.append({
+            source_items.append({
                 "hash": h,
                 "title": entry.get("title", "Sin titulo"),
                 "link": entry.get("link", ""),
@@ -127,10 +130,26 @@ def fetch_new_relevant_items():
                 "source": feed.feed.get("title", url),
                 "published": entry.get("published", ""),
             })
-            seen[h] = {"title": entry.get("title", ""), "date": datetime.now().isoformat()}
+
+        if source_items:
+            items_by_source.append(source_items)
+
+    # Ahora intercalamos: 1 item de la fuente A, 1 de la B, 1 de la C, etc.
+    # Esto garantiza diversidad de fuentes en cada corrida.
+    new_items = []
+    idx = 0
+    while len(new_items) < MAX_ITEMS_PER_RUN and any(items_by_source):
+        for source_items in items_by_source:
+            if idx < len(source_items):
+                item = source_items[idx]
+                new_items.append(item)
+                seen[item["hash"]] = {"title": item["title"], "date": datetime.now().isoformat()}
+                if len(new_items) >= MAX_ITEMS_PER_RUN:
+                    break
+        idx += 1
 
     save_seen(seen)
-    return new_items[:MAX_ITEMS_PER_RUN]
+    return new_items
 
 
 # ----------------------------------------------------------------------
@@ -139,27 +158,109 @@ def fetch_new_relevant_items():
 
 def build_prompt(item):
     """
-    El prompt le pide explicitamente a Gemini que NO copie frases textuales,
-    que aporte contexto propio y que liste las fuentes. Esto es clave tanto
-    para SEO (E-E-A-T) como para evitar problemas de derechos de autor.
+    Prompt disenado para maximizar el SEO Score de Rank Math (apuntando a 85+),
+    sin sacrificar calidad editorial real ni caer en keyword stuffing.
+
+    Cubre los checks principales que evalua Rank Math:
+    - Basic SEO: keyword en titulo, meta description, URL, primer 10% del
+      contenido, contenido en general, longitud minima.
+    - Additional: keyword en subtitulos (H2/H3), densidad de keyword,
+      alt text de imagenes, enlaces internos y externos.
+    - Title Readability: keyword al inicio del titulo, power word, numero,
+      longitud del titulo (~50-60 caracteres).
+    - Content Readability: parrafos cortos, subtitulos frecuentes,
+      voz activa, transiciones.
     """
-    return f"""Actua como un periodista senior especializado en tecnologia,
+    return f"""Actua como un redactor SEO senior especializado en tecnologia,
+con dominio experto de los criterios de puntuacion de Rank Math para WordPress,
 escribiendo para el sitio argentino tecno.ar.
 
-Con base en la siguiente informacion de una fuente de autoridad, redacta una
-nota periodistica original en espanol, de entre 600 y 800 palabras.
-
+FUENTE DE REFERENCIA (no copiar frases, solo usar como base factual):
 Titulo original: {item['title']}
-Fuente: {item['source']}
-Resumen disponible: {item['summary']}
+Medio: {item['source']}
+Resumen: {item['summary']}
 URL original: {item['link']}
 
-Reglas estrictas:
-- NO copies frases textuales de la fuente; parafrasea completamente con tus propias palabras.
-- Agrega contexto o una perspectiva adicional que no este en el resumen (por que importa, que implica para el usuario, comparacion con antecedentes).
-- Tono profesional pero cercano, sin sonar generico ni "hecho por IA" (evita frases hechas tipo "en la era digital actual", "es importante destacar", etc.).
-- Al final, agrega una linea "Fuente: {item['source']}" con el link.
-- Devolveme SOLO el texto de la nota en Markdown, con un titulo H1 propio (no copies el titulo original tal cual, mejoralo), sin comentarios adicionales.
+===========================================
+PASO 1: DEFINI EL FOCUS KEYWORD
+===========================================
+Elegi UN focus keyword principal (2-4 palabras, en espanol, con intencion de
+busqueda real, no generico) que represente el tema central de la noticia.
+Todo lo que sigue debe girar alrededor de ese keyword, de forma natural,
+sin forzarlo ni repetirlo de forma artificial.
+
+===========================================
+PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
+===========================================
+
+## FOCUS_KEYWORD
+[el keyword elegido]
+
+## SEO_TITLE
+Titulo de 50-60 caracteres. Reglas obligatorias:
+- El focus keyword debe aparecer LO MAS CERCA POSIBLE DEL INICIO del titulo.
+- Incluir un numero O una power word (ej: "clave", "revolucionario", "definitivo",
+  "urgente", "confirmado", "oficial") cuando sea genuino y no clickbait vacio.
+- Debe generar curiosidad real sin exagerar ni mentir sobre el contenido.
+
+## SLUG
+version-corta-en-minusculas-con-guiones-del-focus-keyword
+(3-5 palabras maximo, sin stopwords como "el", "la", "de", "en" salvo que sean
+imprescindibles para el sentido)
+
+## META_DESCRIPTION
+Entre 150 y 160 caracteres. Debe incluir el focus keyword de forma natural
+y un llamado a la accion implicito (ej: "descubri por que", "te contamos como").
+
+## H1
+El titulo visible del articulo (puede ser igual o levemente distinto al SEO_TITLE).
+Debe incluir el focus keyword.
+
+## ARTICULO
+El cuerpo de la nota en Markdown, siguiendo ESTAS reglas de estructura y redaccion:
+
+1. ESTRUCTURA:
+   - El focus keyword debe aparecer en el PRIMER PARRAFO (primeras ~100 palabras).
+   - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##), y H3 (###) si aplica.
+   - Al menos UN subtitulo H2 debe contener el focus keyword o una variacion natural.
+   - Parrafos cortos: maximo 3-4 lineas cada uno. Nada de bloques de texto densos.
+   - Extension total: entre 600 y 900 palabras (Rank Math penaliza contenido
+     "delgado" de menos de 600 palabras).
+
+2. DENSIDAD DE KEYWORD:
+   - El focus keyword (o variaciones naturales/sinonimos cercanos) debe aparecer
+     entre el 1% y el 1.5% del total de palabras. NO fuerces repeticiones
+     antinaturales solo para cumplir esta metrica: prioriza que se lea humano.
+
+3. CONTENIDO Y CALIDAD (no negociable):
+   - NO copies frases textuales de la fuente; parafrasea completamente.
+   - Agrega contexto, antecedentes o una perspectiva que no este en el resumen
+     original (por que importa, que cambia para el usuario, comparacion con
+     hechos previos). Esto es lo que Google llama "contenido util" (helpful content)
+     y es mas importante que cualquier metrica de keyword.
+   - Evita frases genericas de relleno tipicas de IA ("en la era digital actual",
+     "es importante destacar que", "sin duda alguna", "en resumen"). Escribi como
+     un periodista humano especializado, con opiniones y matices propios.
+   - Voz activa, tono profesional pero cercano (espanol rioplatense).
+
+4. ENLACES (dejalos marcados para que el editor los complete):
+   - Incluir al menos 1 sugerencia de ENLACE INTERNO marcada como:
+     [ENLACE INTERNO SUGERIDO: nota relacionada sobre <tema>]
+   - Incluir al menos 1 ENLACE EXTERNO real hacia la fuente original o una
+     fuente primaria (ej: comunicado oficial de la empresa), en formato Markdown:
+     [texto del enlace]({item['link']})
+
+5. IMAGEN:
+   - Al final, sugeri un ALT_TEXT para la imagen destacada, de 8-12 palabras,
+     descriptivo, que incluya el focus keyword de forma natural (no forzada).
+
+===========================================
+FORMATO DE SALIDA
+===========================================
+Devolveme EXCLUSIVAMENTE los campos de arriba (FOCUS_KEYWORD, SEO_TITLE, SLUG,
+META_DESCRIPTION, H1, ARTICULO, ALT_TEXT) con esos encabezados exactos en
+Markdown. No agregues explicaciones, comentarios ni texto fuera de esa estructura.
+Al final del ARTICULO, agrega una linea: "Fuente: {item['source']}".
 """
 
 
