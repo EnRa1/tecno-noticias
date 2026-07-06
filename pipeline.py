@@ -30,8 +30,8 @@ GEMINI_URL = (
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
-MAX_ITEMS_PER_RUN = 8
-MAX_HOURS_OLD = 24
+MAX_ITEMS_PER_RUN = 6
+MAX_HOURS_OLD = 12
 
 # ======================================================================
 # DICCIONARIOS COMPLETOS Y EXPANSIVOS
@@ -567,7 +567,7 @@ def main():
 
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
-        time.sleep(4)
+        time.sleep(8)
 
     print("\n✅ Pipeline finalizado.")
 
