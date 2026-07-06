@@ -474,22 +474,46 @@ def save_draft(item, article_md):
 # MAIN
 # ----------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# MAIN (VERSIÓN CORREGIDA CON WORDPRESS)
+# ----------------------------------------------------------------------
+
 def main():
     print("🚀 Iniciando pipeline con filtro IA (Gemini)...")
     items = fetch_new_relevant_items()
     print(f"Encontrados {len(items)} items nuevos para procesar.")
+
+    # Intentar importar la función de publicación de WordPress
+    try:
+        from publish_to_wordpress import generate_and_publish
+        tiene_wp = True
+    except ImportError:
+        print("⚠️ No se encontró 'publish_to_wordpress'. Los borradores se guardarán LOCALMENTE.")
+        tiene_wp = False
 
     for item in items:
         print(f"\nRedactando: {item['title'][:70]}...")
         try:
             prompt = build_prompt(item)
             article = call_gemini(prompt)
-            save_draft(item, article)
+
+            # --- Publicar en WordPress (si existe) ---
+            if tiene_wp:
+                try:
+                    generate_and_publish(item, article)
+                    print(f"✅ Borrador subido a WordPress: {item['title'][:50]}...")
+                except Exception as wp_err:
+                    print(f"⚠️ Error al subir a WP, guardando local: {wp_err}")
+                    save_draft(item, article)  # Fallback local
+            else:
+                # Si no hay WP, guardamos local como siempre
+                save_draft(item, article)
+
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
         time.sleep(4)  # respeta el limite de RPM del free tier
 
-    print("\n✅ Listo. Revisa la carpeta drafts/ antes de publicar cualquier nota.")
+    print("\n✅ Pipeline finalizado.")
 
 if __name__ == "__main__":
     main()
