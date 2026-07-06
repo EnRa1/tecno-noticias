@@ -3,9 +3,6 @@ name: Pipeline de contenido tecno.ar
 permissions: write-all
 
 on:
-  schedule:
-    - cron: "50 17 * * *"
-    - cron: "15 21 * * *"
   workflow_dispatch: {}
 
 jobs:
