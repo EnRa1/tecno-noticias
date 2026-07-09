@@ -2,5 +2,7 @@ feedparser>=6.0.0
 requests>=2.31.0
 markdown>=3.5.0
 google-genai>=1.0.0
-newspaper3k==0.2.8
-lxml_html_clean
+trafilatura==1.12.2
+readability-lxml==0.8.1
+beautifulsoup4==4.12.3
+lxml==5.3.0
