@@ -4,7 +4,7 @@ Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo)
 ==========================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada) -> elige las 3 mejores
-3. Extraccion del articulo completo desde la URL (newspaper3k)
+3. Extraccion del articulo completo desde la URL (trafilatura + readability)
 4. Redaccion con Gemini usando el articulo completo (calidad superior)
 """
 
@@ -17,7 +17,10 @@ import time
 import hashlib
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from newspaper import Article  # <-- NUEVA DEPENDENCIA
+
+import trafilatura
+from readability import Document
+from bs4 import BeautifulSoup
 
 # ----------------------------------------------------------------------
 # CONFIGURACION
@@ -37,6 +40,16 @@ GEMINI_URL = (
 
 MAX_ITEMS_PER_RUN = 3  # <--- REDUCIDO A 3 para no consumir cuota
 MAX_HOURS_OLD = 24
+
+# Headers realistas para no ser bloqueado por medios (The Verge, TechCrunch, etc. filtran bots)
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 # Palabras clave para el filtro rapido (barrera de entrada)
 KEYWORDS = [
@@ -156,35 +169,81 @@ def compute_relevance_score(entry_text):
     return max(0, min(10, score)), (categorias[0] if categorias else "general")
 
 # ----------------------------------------------------------------------
-# NUEVO: EXTRACCIÓN DEL ARTÍCULO COMPLETO
+# EXTRACCIÓN DEL ARTÍCULO COMPLETO (robusta, con fallback en cascada)
 # ----------------------------------------------------------------------
+
+def _fetch_html(url, timeout=15):
+    """Descarga el HTML crudo con headers realistas y timeout corto."""
+    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout, allow_redirects=True)
+    resp.raise_for_status()
+    resp.encoding = resp.apparent_encoding  # evita textos con caracteres rotos (acentos, ñ, etc.)
+    return resp.text
+
+
+def _extract_with_trafilatura(html, url):
+    """Método principal: funciona bien tanto en medios grandes (The Verge, TechCrunch)
+    como en medios argentinos (Xataka, La Nación, Infobae, etc.)."""
+    text = trafilatura.extract(
+        html,
+        url=url,
+        favor_precision=True,
+        include_comments=False,
+        include_tables=False,
+    )
+    if text and len(text) >= 200:
+        metadata = trafilatura.extract_metadata(html, default_url=url)
+        return {
+            "title": metadata.title if metadata else "",
+            "text": text,
+            "authors": [metadata.author] if metadata and metadata.author else [],
+            "publish_date": metadata.date if metadata else None,
+            "top_image": metadata.image if metadata else None,
+        }
+    return None
+
+
+def _extract_with_readability(html, url):
+    """Fallback si trafilatura no consigue suficiente texto (sitios con markup atípico)."""
+    try:
+        doc = Document(html)
+        title = doc.short_title()
+        summary_html = doc.summary()
+        soup = BeautifulSoup(summary_html, "html.parser")
+        text = "\n\n".join(
+            p.get_text(strip=True) for p in soup.find_all("p") if p.get_text(strip=True)
+        )
+        if text and len(text) >= 200:
+            return {"title": title, "text": text, "authors": [], "publish_date": None, "top_image": None}
+    except Exception:
+        pass
+    return None
+
 
 def extract_full_article(url):
     """
-    Extrae el contenido completo de un artículo desde su URL usando newspaper3k.
-    Si falla, devuelve un diccionario con el texto parcial.
+    Extrae el contenido completo de un artículo desde su URL.
+    Orden de intentos: trafilatura -> readability -> None (usa el resumen del RSS).
+    Sirve tanto para medios internacionales como argentinos, sin reglas por sitio.
     """
     try:
         print(f"📄 Extrayendo artículo completo: {url[:60]}...")
-        article = Article(url)
-        article.download()
-        article.parse()
-
-        # Si no se pudo extraer texto, usar resumen
-        if not article.text or len(article.text) < 100:
-            print(f"⚠️ Texto muy corto o vacío, usando fallback.")
-            return None
-
-        return {
-            "title": article.title or "",
-            "text": article.text,
-            "authors": article.authors,
-            "publish_date": article.publish_date,
-            "top_image": article.top_image,
-        }
-    except Exception as e:
-        print(f"⚠️ Error extrayendo artículo {url}: {e}")
+        html = _fetch_html(url)
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ No se pudo descargar la URL ({type(e).__name__}): {e}")
         return None
+
+    result = _extract_with_trafilatura(html, url)
+    if result:
+        print(f"✅ Extraído con trafilatura ({len(result['text'])} caracteres)")
+        return result
+
+    result = _extract_with_readability(html, url)
+    if result:
+        print(f"✅ Extraído con readability (fallback) ({len(result['text'])} caracteres)")
+        return result
+
+    print("⚠️ Ningún método pudo extraer texto útil, se usará el resumen del RSS.")
+    return None
 
 # ----------------------------------------------------------------------
 # FILTRO CONTEXTUAL CON GEMINI (1 SOLA LLAMADA)
@@ -237,7 +296,7 @@ def rank_with_gemini(candidatos):
             raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
             result = json.loads(raw_text)
             indices = result.get("seleccionados", [])
-            
+
             if not indices:
                 print("⚠️ Gemini no devolvió índices, usando orden por reglas.")
                 return candidatos[:MAX_ITEMS_PER_RUN]
@@ -245,10 +304,10 @@ def rank_with_gemini(candidatos):
             seleccionados = []
             for i in indices:
                 if 1 <= i <= len(candidatos):
-                    seleccionados.append(candidatos[i-1])
+                    seleccionados.append(candidatos[i - 1])
                 if len(seleccionados) >= MAX_ITEMS_PER_RUN:
                     break
-            
+
             print(f"✅ Gemini seleccionó {len(seleccionados)} noticias por contexto.")
             return seleccionados
         else:
@@ -343,7 +402,7 @@ def fetch_new_relevant_items():
     return seleccionados_final
 
 # ----------------------------------------------------------------------
-# NUEVO: REDACCION CON ARTICULO COMPLETO
+# REDACCION CON ARTICULO COMPLETO
 # ----------------------------------------------------------------------
 
 def build_prompt(item, full_text):
@@ -352,7 +411,7 @@ def build_prompt(item, full_text):
     """
     # Limitar el texto a 8000 caracteres para no exceder el contexto de Gemini
     text_limit = full_text[:8000] if full_text else item['summary']
-    
+
     return f"""Actua como un redactor SEO senior especializado en tecnologia,
 con dominio experto de los criterios de puntuacion de Rank Math para WordPress,
 escribiendo para el sitio argentino tecno.ar.
@@ -438,10 +497,10 @@ def main():
 
     for item in items:
         print(f"\n📄 Procesando: {item['title'][:70]}...")
-        
+
         # 1. Extraer el artículo completo
         full_article = extract_full_article(item['link'])
-        
+
         # 2. Si no se pudo extraer, usar el resumen como fallback
         if full_article and full_article.get('text'):
             contenido_para_redactar = full_article['text']
