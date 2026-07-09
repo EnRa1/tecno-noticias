@@ -1,0 +1,30 @@
+name: Publicar en Instagram al publicar en WordPress
+
+on:
+  repository_dispatch:
+    types: [instagram_publish]
+
+jobs:
+  publicar-instagram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Generar y publicar en Instagram
+        env:
+          IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+          IG_TITLE: ${{ github.event.client_payload.title }}
+          IG_IMAGE_URL: ${{ github.event.client_payload.image_url }}
+          IG_PERMALINK: ${{ github.event.client_payload.permalink }}
+          IG_EXCERPT: ${{ github.event.client_payload.excerpt }}
+        run: python publish_from_wordpress.py
