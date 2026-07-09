@@ -34,7 +34,7 @@ def clean_excerpt(raw_html, max_chars=600):
 
 def build_caption_from_wp(title, excerpt, permalink):
     hashtags = "#Tecnologia #TecnoAR #Argentina #Innovacion #Noticias"
-    partes = [title]
+    partes = []
     if excerpt:
         partes.append(excerpt)
     partes.append("📲 Nota completa en el link de la bio.")
