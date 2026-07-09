@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatización para tecno.ar (Hybrid 2.0)
-Diccionarios completos y expansivos para capturar todo el espectro tecnológico.
+Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo)
+==========================================================================
+1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
+2. Filtro contextual con Gemini (1 sola llamada) -> elige las 3 mejores
+3. Extraccion del articulo completo desde la URL (newspaper3k)
+4. Redaccion con Gemini usando el articulo completo (calidad superior)
 """
 
 import feedparser
@@ -13,9 +17,10 @@ import time
 import hashlib
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from newspaper import Article  # <-- NUEVA DEPENDENCIA
 
 # ----------------------------------------------------------------------
-# CONFIGURACIÓN
+# CONFIGURACION
 # ----------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).parent
@@ -30,165 +35,19 @@ GEMINI_URL = (
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
-MAX_ITEMS_PER_RUN = 6
-MAX_HOURS_OLD = 12
+MAX_ITEMS_PER_RUN = 3  # <--- REDUCIDO A 3 para no consumir cuota
+MAX_HOURS_OLD = 24
 
-# ======================================================================
-# DICCIONARIOS COMPLETOS Y EXPANSIVOS
-# ======================================================================
-
-# ----------------------------------------------------------------------
-# 1. FILTRO DE RELEVANCIA GENERAL (KEYWORDS)
-#    - Palabras que indican que la noticia es de tecnología.
-#    - Debe ser amplio para no descartar nada relevante.
-# ----------------------------------------------------------------------
+# Palabras clave para el filtro rapido (barrera de entrada)
 KEYWORDS = [
-    # Inteligencia Artificial
-    "inteligencia artificial", "ai", "machine learning", "deep learning",
-    "red neuronal", "llm", "gpt", "chatgpt", "gemini", "claude", "copilot",
-    "modelo de lenguaje", "ia generativa", "stable diffusion", "midjourney",
-    "dalle", "openai", "anthropic", "deepmind", "hugging face",
-
-    # Ciberseguridad
-    "ciberseguridad", "seguridad informatica", "hacker", "ransomware",
-    "malware", "virus", "phishing", "zero-day", "vulnerabilidad",
-    "firewall", "encriptacion", "privacidad", "filtracion", "data breach",
-    "ciberataque", "autenticacion", "biometria",
-
-    # Hardware y electrónica
-    "hardware", "procesador", "chip", "cpu", "gpu", "nvidia", "amd", "intel",
-    "apple silicon", "ryzen", "core ultra", "snapdragon", "mediatek",
-    "semiconductor", "tsmc", "ram", "ddr5", "ssd", "almacenamiento",
-    "monitor", "pantalla", "oled", "microled", "arm", "risc-v",
-    "smartphone", "celular", "iphone", "samsung", "galaxy", "pixel",
-    "xiaomi", "huawei", "fold", "flip", "plegable", "tablet", "ipad",
-    "notebook", "laptop", "ultrabook", "smartwatch", "wearable",
-    "auriculares", "airpods", "consola", "playstation", "xbox", "nintendo",
-    "switch", "ps5", "game pass", "steam", "tarjeta grafica",
-    "periferico", "teclado", "mouse", "smart tv", "televisor",
-    "auto electrico", "vehiculo electrico", "ev", "bateria", "grafeno",
-
-    # Software y sistemas operativos
-    "software", "app", "aplicacion", "windows", "linux", "ubuntu", "macos",
-    "ios", "android", "chrome os", "actualizacion", "parche", "bug",
-    "microsoft", "apple", "google", "beta", "open source", "codigo abierto",
-    "git", "github", "software libre", "framework", "api", "backend",
-    "frontend", "devops", "microservicios", "contenedores", "docker",
-    "kubernetes", "cloud", "nube", "aws", "azure", "gcp", "oracle",
-
-    # Internet, Web y comunicaciones
-    "internet", "web", "navegador", "chrome", "firefox", "safari", "edge",
-    "5g", "wifi", "fibra optica", "starlink", "satelite", "telecomunicaciones",
-    "redes", "protocolo", "tcp/ip", "dns", "cdn", "streaming", "netflix",
-    "spotify", "youtube", "twitch", "podcast", "online", "digital",
-
-    # Tecnología emergente y ciencia
-    "metaverso", "realidad virtual", "realidad aumentada", "vr", "ar",
-    "blockchain", "web3", "cripto", "bitcoin", "ethereum", "nft",
-    "robot", "robotica", "dron", "automatizacion", "iot", "internet de las cosas",
-    "smart home", "hogar inteligente", "asistente virtual", "siri", "alexa",
-    "espacio", "nasa", "spacex", "starship", "ciencia", "investigacion",
-    "descubrimiento", "fisica", "cuantico", "biotecnologia", "salud",
-    "innovacion", "tecnologia", "tecnológico", "digital", "electrónico",
-    "gadget", "dispositivo", "sensor", "wearable", "impresion 3d",
-
-    # Negocios, startups y economía digital
-    "startup", "emprendimiento", "inversion", "financiacion", "unicornio",
-    "mercado", "acciones", "nasdaq", "tesla", "spacex", "amazon", "meta",
-    "alphabet", "oracle", "salesforce", "uber", "mercado libre",
-    "globant", "despegar", "tiendanube", "auth0", "satellogic",
-    "economia digital", "fintech", "ecommerce", "comercio electronico",
+    "inteligencia artificial", "ai", "ciberseguridad", "seguridad informatica",
+    "software", "hardware", "app", "smartphone", "google", "microsoft",
+    "apple", "startup", "tecnologia", "internet", "nube", "cloud",
 ]
 
 # ----------------------------------------------------------------------
-# 2. PALABRAS CLAVE DE HARDWARE (para puntuación)
+# UTILIDADES
 # ----------------------------------------------------------------------
-HARDWARE_KEYWORDS = [
-    # Procesadores y chips
-    "procesador", "chip", "cpu", "gpu", "nvidia", "amd", "intel",
-    "apple silicon", "ryzen", "core ultra", "snapdragon", "mediatek",
-    "semiconductor", "tsmc", "arm", "risc-v",
-
-    # Componentes
-    "ram", "ddr5", "ssd", "almacenamiento", "monitor", "pantalla",
-    "oled", "microled", "tarjeta grafica", "placa de video", "motherboard",
-    "placa madre", "disco duro", "hdd", "fuente de poder", "cooler",
-    "ventilador", "gabinete", "mouse", "teclado", "auriculares",
-
-    # Dispositivos móviles
-    "smartphone", "celular", "iphone", "samsung", "galaxy", "pixel",
-    "xiaomi", "huawei", "oneplus", "oppo", "vivo", "realme", "motorola",
-    "fold", "flip", "plegable", "tablet", "ipad", "smartwatch", "wearable",
-
-    # Laptops y PCs
-    "notebook", "laptop", "ultrabook", "chromebook", "surface", "macbook",
-    "pc", "computadora", "escritorio", "all-in-one", "mini pc", "workstation",
-
-    # Gaming
-    "consola", "playstation", "ps5", "ps4", "xbox", "nintendo", "switch",
-    "steam", "xbox game pass", "psn", "joystick", "control", "gaming",
-
-    # Televisores y audio
-    "smart tv", "televisor", "oled", "qled", "microled", "samsung tv",
-    "sony tv", "lg tv", "home theater", "soundbar", "bocina", "altavoz",
-
-    # Automoción y energía
-    "auto electrico", "vehiculo electrico", "ev", "tesla", "bateria",
-    "grafeno", "litio", "carga rapida", "autonomia", "conduccion autonoma",
-]
-
-# ----------------------------------------------------------------------
-# 3. PALABRAS CLAVE DE IA
-# ----------------------------------------------------------------------
-AI_KEYWORDS = [
-    "inteligencia artificial", "modelo de ia", "llm", "chatgpt", "gemini",
-    "claude", "openai", "anthropic", "copilot", "gpt-", "modelo de lenguaje",
-    "machine learning", "deep learning", "red neuronal", "redes neuronales",
-    "ai", "ml", "dl", "nlp", "procesamiento de lenguaje natural",
-    "visión por computadora", "computer vision", "reconocimiento facial",
-    "generación de texto", "generación de imágenes", "stable diffusion",
-    "midjourney", "dalle", "hugging face", "transformers", "bert",
-    "tensorflow", "pytorch", "keras", "ia generativa", "agentes ia",
-    "autogpt", "ai agents", "seguridad ia", "etica ia", "regulacion ia",
-]
-
-# ----------------------------------------------------------------------
-# 4. PALABRAS CLAVE DE ARGENTINA (y tecnología local)
-# ----------------------------------------------------------------------
-ARGENTINA_KEYWORDS = [
-    "argentina", "argentino", "argentina tech", "buenos aires",
-    "mercado libre", "mercadolibre", "globant", "ualá", "uala",
-    "satellogic", "auth0", "despegar", "tiendanube", "meli",
-    "argentine", "startup argentina", "unicornio argentino",
-    "ecosistema tech argentino", "programadores argentinos",
-    "desarrolladores argentinos", "software argentino", "hardware argentino",
-    "ciencia argentina", "tecnologia argentina", "innovacion argentina",
-]
-
-# ----------------------------------------------------------------------
-# 5. PALABRAS CLAVE DE LANZAMIENTOS
-# ----------------------------------------------------------------------
-LAUNCH_KEYWORDS = [
-    "lanza", "lanzamiento", "presenta", "presento", "anuncia", "anuncio",
-    "debuta", "revela", "sale a la venta", "disponible desde", "estrena",
-    "launches", "unveils", "announces", "introduces", "debuts", "reveals",
-    "nuevo modelo", "nueva version", "nuevo producto", "ahora disponible",
-    "ya disponible", "preventa", "reserva", "llegada", "arribo",
-]
-
-# ----------------------------------------------------------------------
-# 6. PALABRAS DE PENALIZACIÓN (clickbait, contenido vacío)
-# ----------------------------------------------------------------------
-PENALTY_KEYWORDS = [
-    "lo que tenés que saber", "imperdible", "no te pierdas", "resumen del día",
-    "lo mejor de", "top 5", "top 10", "los mejores", "los peores",
-    "opinión", "análisis subjetivo", "por qué", "vale la pena",
-    "guía definitiva", "tutorial completo", "paso a paso",
-]
-
-# ======================================================================
-# FUNCIONES DEL SISTEMA
-# ======================================================================
 
 def load_feeds():
     urls = []
@@ -218,6 +77,10 @@ def slugify(text):
     text = re.sub(r"[^\w\s-]", "", text.lower())
     return re.sub(r"[\s_-]+", "-", text).strip("-")[:60]
 
+# ----------------------------------------------------------------------
+# FILTRO POR FECHA
+# ----------------------------------------------------------------------
+
 def is_recent(entry, max_hours=MAX_HOURS_OLD):
     published_parsed = entry.get('published_parsed') or entry.get('updated_parsed')
     if not published_parsed:
@@ -228,6 +91,41 @@ def is_recent(entry, max_hours=MAX_HOURS_OLD):
     if diff.total_seconds() < 0:
         return True
     return diff.total_seconds() <= max_hours * 3600
+
+# ----------------------------------------------------------------------
+# SISTEMA DE SCORING POR REGLAS (SOLO PARA PREFILTRAR)
+# ----------------------------------------------------------------------
+
+LAUNCH_KEYWORDS = [
+    "lanza", "lanzamiento", "presenta", "presento", "anuncia", "anuncio",
+    "debuta", "revela", "sale a la venta", "disponible desde", "estrena",
+    "launches", "unveils", "announces", "introduces", "debuts", "reveals",
+]
+
+HARDWARE_KEYWORDS = [
+    "smartphone", "celular", "iphone", "procesador", "chip", "cpu", "gpu",
+    "tarjeta grafica", "periferico", "teclado", "mouse", "auriculares",
+    "smart tv", "televisor", "auto electrico", "vehiculo electrico", "ev",
+    "tablet", "notebook", "laptop", "smartwatch", "wearable", "consola",
+    "placa de video", "motherboard", "placa madre", "bateria", "grafeno",
+]
+
+ARGENTINA_KEYWORDS = [
+    "argentina", "argentino", "buenos aires",
+    "mercado libre", "mercadolibre", "globant", "uala", "ualá",
+    "satellogic", "auth0", "despegar", "tiendanube",
+]
+
+AI_KEYWORDS = [
+    "inteligencia artificial", "modelo de ia", "llm", "chatgpt", "gemini",
+    "claude", "openai", "anthropic", "copilot", "gpt-", "modelo de lenguaje",
+    "machine learning", "deep learning", "red neuronal"
+]
+
+PENALTY_KEYWORDS = [
+    "lo que tenés que saber", "imperdible", "no te pierdas", "resumen del día",
+    "lo mejor de", "top 5", "top 10"
+]
 
 def compute_relevance_score(entry_text):
     text = entry_text.lower()
@@ -257,6 +155,41 @@ def compute_relevance_score(entry_text):
 
     return max(0, min(10, score)), (categorias[0] if categorias else "general")
 
+# ----------------------------------------------------------------------
+# NUEVO: EXTRACCIÓN DEL ARTÍCULO COMPLETO
+# ----------------------------------------------------------------------
+
+def extract_full_article(url):
+    """
+    Extrae el contenido completo de un artículo desde su URL usando newspaper3k.
+    Si falla, devuelve un diccionario con el texto parcial.
+    """
+    try:
+        print(f"📄 Extrayendo artículo completo: {url[:60]}...")
+        article = Article(url)
+        article.download()
+        article.parse()
+
+        # Si no se pudo extraer texto, usar resumen
+        if not article.text or len(article.text) < 100:
+            print(f"⚠️ Texto muy corto o vacío, usando fallback.")
+            return None
+
+        return {
+            "title": article.title or "",
+            "text": article.text,
+            "authors": article.authors,
+            "publish_date": article.publish_date,
+            "top_image": article.top_image,
+        }
+    except Exception as e:
+        print(f"⚠️ Error extrayendo artículo {url}: {e}")
+        return None
+
+# ----------------------------------------------------------------------
+# FILTRO CONTEXTUAL CON GEMINI (1 SOLA LLAMADA)
+# ----------------------------------------------------------------------
+
 def rank_with_gemini(candidatos):
     if not candidatos or len(candidatos) <= MAX_ITEMS_PER_RUN:
         return candidatos
@@ -273,23 +206,20 @@ def rank_with_gemini(candidatos):
 
     prompt = f"""
     Eres un editor jefe de un blog de tecnología llamado tecno.ar, con audiencia argentina.
-    Tu tarea es seleccionar las 8 noticias MÁS RELEVANTES Y CON CONTEXTO de la siguiente lista.
+    Tu tarea es seleccionar las {MAX_ITEMS_PER_RUN} noticias MÁS RELEVANTES Y CON CONTEXTO de la siguiente lista.
 
     Criterios de selección (en orden de prioridad):
-    1. **Lanzamientos oficiales** de hardware (celulares, procesadores, GPU, etc.) o software (nuevos sistemas operativos, apps).
-    2. **Avances reales en Inteligencia Artificial** (nuevos modelos, aplicaciones prácticas, regulaciones).
-    3. **Tecnología argentina** o que impacte directamente en Argentina (Mercado Libre, startups locales, leyes).
+    1. **Lanzamientos oficiales** de hardware (celulares, procesadores, GPU, etc.) o software.
+    2. **Avances reales en Inteligencia Artificial** (nuevos modelos, aplicaciones prácticas).
+    3. **Tecnología argentina** o que impacte directamente en Argentina.
     4. **Ciberseguridad** (ataques reales, vulnerabilidades críticas).
-    5. **Ciencia y tecnología** (descubrimientos, avances espaciales, biotecnología).
-    6. **Economía digital y startups** (financiaciones, adquisiciones, nuevas empresas).
-    7. Ignora artículos de opinión, análisis retrospectivos ("Por qué X fracasó"), o rumores sin fuentes concretas.
-    8. Ignora tutoriales, guías, "cómo hacer", o contenido educativo básico.
+    5. Ignora artículos de opinión, análisis retrospectivos, o rumores sin fuentes.
 
     Lista de noticias:
     {lista_texto}
 
-    Debes devolver SOLO un JSON con los números de los 8 índices seleccionados, en orden de prioridad.
-    Formato exacto: {{"seleccionados": [3, 7, 12, 15, 18, 22, 25, 30]}}
+    Debes devolver SOLO un JSON con los números de los {MAX_ITEMS_PER_RUN} índices seleccionados, en orden de prioridad.
+    Formato exacto: {{"seleccionados": [3, 7, 12]}}
     """
 
     payload = {
@@ -310,7 +240,7 @@ def rank_with_gemini(candidatos):
             
             if not indices:
                 print("⚠️ Gemini no devolvió índices, usando orden por reglas.")
-                return candidatos
+                return candidatos[:MAX_ITEMS_PER_RUN]
 
             seleccionados = []
             for i in indices:
@@ -323,12 +253,16 @@ def rank_with_gemini(candidatos):
             return seleccionados
         else:
             print(f"⚠️ Error en Gemini (ranking): {resp.status_code}, usando orden por reglas.")
-            return candidatos
+            return candidatos[:MAX_ITEMS_PER_RUN]
     except Exception as e:
         print(f"⚠️ Excepción en Gemini (ranking): {e}, usando orden por reglas.")
-        return candidatos
+        return candidatos[:MAX_ITEMS_PER_RUN]
 
-MAX_POR_FUENTE = max(2, MAX_ITEMS_PER_RUN // 3)
+# ----------------------------------------------------------------------
+# INGESTA + FILTROS
+# ----------------------------------------------------------------------
+
+MAX_POR_FUENTE = max(1, MAX_ITEMS_PER_RUN // 2)
 
 def fetch_new_relevant_items():
     seen = load_seen()
@@ -385,6 +319,7 @@ def fetch_new_relevant_items():
     else:
         seleccionados_por_ia = candidatos
 
+    # Tope por fuente (equidad)
     seleccionados_final = []
     conteo_por_fuente = {}
 
@@ -408,27 +343,33 @@ def fetch_new_relevant_items():
     return seleccionados_final
 
 # ----------------------------------------------------------------------
-# REDACCION Y PUBLICACION (sin cambios)
+# NUEVO: REDACCION CON ARTICULO COMPLETO
 # ----------------------------------------------------------------------
 
-def build_prompt(item):
+def build_prompt(item, full_text):
+    """
+    Construye el prompt para Gemini usando el artículo completo extraído.
+    """
+    # Limitar el texto a 8000 caracteres para no exceder el contexto de Gemini
+    text_limit = full_text[:8000] if full_text else item['summary']
+    
     return f"""Actua como un redactor SEO senior especializado en tecnologia,
 con dominio experto de los criterios de puntuacion de Rank Math para WordPress,
 escribiendo para el sitio argentino tecno.ar.
 
-FUENTE DE REFERENCIA (no copiar frases, solo usar como base factual):
+FUENTE DE REFERENCIA (USA ESTE TEXTO COMPLETO PARA REDACTAR, NO INVENTES DATOS):
 Titulo original: {item['title']}
 Medio: {item['source']}
-Resumen: {item['summary']}
 URL original: {item['link']}
+
+TEXTO COMPLETO DEL ARTICULO (basate en esto para redactar, sin inventar):
+{text_limit}
 
 ===========================================
 PASO 1: DEFINI EL FOCUS KEYWORD
 ===========================================
 Elegi UN focus keyword principal (2-4 palabras, en espanol, con intencion de
 busqueda real, no generico) que represente el tema central de la noticia.
-Todo lo que sigue debe girar alrededor de ese keyword, de forma natural,
-sin forzarlo ni repetirlo de forma artificial.
 
 ===========================================
 PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
@@ -438,52 +379,35 @@ PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
 [el keyword elegido]
 
 ## SEO_TITLE
-Titulo de 50-60 caracteres. Reglas obligatorias:
+Titulo de 50-60 caracteres. Reglas:
 - El focus keyword debe aparecer LO MAS CERCA POSIBLE DEL INICIO del titulo.
-- Incluir un numero O una power word (ej: "clave", "revolucionario", "definitivo",
-  "urgente", "confirmado", "oficial") cuando sea genuino y no clickbait vacio.
-- Debe generar curiosidad real sin exagerar ni mentir sobre el contenido.
+- Incluir un numero O una power word (ej: "clave", "revolucionario", "oficial").
 
 ## SLUG
 version-corta-en-minusculas-con-guiones-del-focus-keyword
-(3-5 palabras maximo, sin stopwords como "el", "la", "de", "en" salvo que sean
-imprescindibles para el sentido)
+(3-5 palabras maximo)
 
 ## META_DESCRIPTION
-Entre 150 y 160 caracteres. Debe incluir el focus keyword de forma natural
-y un llamado a la accion implicito (ej: "descubri por que", "te contamos como").
+Entre 150 y 160 caracteres. Debe incluir el focus keyword.
 
 ## H1
-El titulo visible del articulo (puede ser igual o levemente distinto al SEO_TITLE).
-Debe incluir el focus keyword.
+El titulo visible del articulo. Debe incluir el focus keyword.
 
 ## ARTICULO
-El cuerpo de la nota en Markdown, siguiendo ESTAS reglas de estructura y redaccion:
-
+El cuerpo de la nota en Markdown (600-900 palabras), siguiendo ESTAS reglas:
 1. ESTRUCTURA:
-   - El focus keyword debe aparecer en el PRIMER PARRAFO (primeras ~100 palabras).
-   - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##), y H3 (###) si aplica.
-   - Al menos UN subtitulo H2 debe contener el focus keyword o una variacion natural.
-   - Parrafos cortos: maximo 3-4 lineas cada uno. Nada de bloques de texto densos.
-   - Extension total: entre 600 y 900 palabras.
-
-2. DENSIDAD DE KEYWORD:
-   - El focus keyword (o variaciones naturales/sinonimos cercanos) debe aparecer
-     entre el 1% y el 1.5% del total de palabras. NO fuerces repeticiones.
-
-3. CONTENIDO Y CALIDAD:
+   - El focus keyword debe aparecer en el PRIMER PARRAFO.
+   - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
+   - Parrafos cortos: maximo 3-4 lineas cada uno.
+2. CONTENIDO:
    - NO copies frases textuales de la fuente; parafrasea completamente.
    - Agrega contexto, antecedentes o una perspectiva que no este en el resumen.
    - Evita frases genericas de relleno tipicas de IA.
    - Voz activa, tono profesional pero cercano (espanol rioplatense).
-
-4. ENLACES:
-   - Incluir al menos 1 sugerencia de ENLACE INTERNO marcada como:
-     [ENLACE INTERNO SUGERIDO: nota relacionada sobre <tema>]
+3. ENLACES:
    - Incluir al menos 1 ENLACE EXTERNO real hacia la fuente original:
      [texto del enlace]({item['link']})
-
-5. IMAGEN:
+4. IMAGEN:
    - Al final, sugeri un ALT_TEXT para la imagen destacada, de 8-12 palabras.
 
 ===========================================
@@ -491,9 +415,65 @@ FORMATO DE SALIDA
 ===========================================
 Devolveme EXCLUSIVAMENTE los campos de arriba (FOCUS_KEYWORD, SEO_TITLE, SLUG,
 META_DESCRIPTION, H1, ARTICULO, ALT_TEXT) con esos encabezados exactos en
-Markdown. No agregues explicaciones, comentarios ni texto fuera de esa estructura.
-Al final del ARTICULO, agrega una linea: "Fuente: {item['source']}".
+Markdown. No agregues explicaciones fuera de esa estructura.
+Al final del ARTICULO, agrega: "Fuente: {item['source']}"
 """
+
+# ----------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------
+
+def main():
+    print("🚀 Iniciando pipeline Hybrid 2.0 con artículos completos...")
+    items = fetch_new_relevant_items()
+    print(f"Encontrados {len(items)} items nuevos para procesar.")
+
+    try:
+        from publish_to_wordpress import generate_and_publish
+        tiene_wp = True
+        print("✅ Integración con WordPress activada.")
+    except ImportError:
+        print("⚠️ No se encontró 'publish_to_wordpress'. Los borradores se guardarán LOCALMENTE.")
+        tiene_wp = False
+
+    for item in items:
+        print(f"\n📄 Procesando: {item['title'][:70]}...")
+        
+        # 1. Extraer el artículo completo
+        full_article = extract_full_article(item['link'])
+        
+        # 2. Si no se pudo extraer, usar el resumen como fallback
+        if full_article and full_article.get('text'):
+            contenido_para_redactar = full_article['text']
+            print(f"✅ Artículo completo extraído ({len(contenido_para_redactar)} caracteres)")
+        else:
+            contenido_para_redactar = item['summary']
+            print(f"⚠️ Usando resumen del RSS ({len(contenido_para_redactar)} caracteres)")
+
+        # 3. Redactar con Gemini
+        try:
+            prompt = build_prompt(item, contenido_para_redactar)
+            article = call_gemini(prompt)
+
+            if tiene_wp:
+                try:
+                    generate_and_publish(item, article)
+                    print(f"✅ Borrador subido a WordPress: {item['title'][:50]}...")
+                except Exception as wp_err:
+                    print(f"⚠️ Error al subir a WP, guardando local: {wp_err}")
+                    save_draft(item, article)
+            else:
+                save_draft(item, article)
+
+        except Exception as e:
+            print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
+        time.sleep(6)  # Pausa más larga para respetar límites
+
+    print("\n✅ Pipeline finalizado.")
+
+# ----------------------------------------------------------------------
+# FUNCIONES RESTANTES (call_gemini, save_draft, etc.)
+# ----------------------------------------------------------------------
 
 def call_gemini(prompt, retries=3):
     if not GEMINI_API_KEY:
@@ -535,41 +515,6 @@ def save_draft(item, article_md):
     )
     path.write_text(header + article_md, encoding="utf-8")
     print(f"[OK] Borrador guardado localmente: {path}")
-
-def main():
-    print("🚀 Iniciando pipeline Hybrid 2.0 con diccionarios completos...")
-    items = fetch_new_relevant_items()
-    print(f"Encontrados {len(items)} items nuevos para procesar.")
-
-    try:
-        from publish_to_wordpress import generate_and_publish
-        tiene_wp = True
-        print("✅ Integración con WordPress activada.")
-    except ImportError:
-        print("⚠️ No se encontró 'publish_to_wordpress'. Los borradores se guardarán LOCALMENTE.")
-        tiene_wp = False
-
-    for item in items:
-        print(f"\nRedactando: {item['title'][:70]}...")
-        try:
-            prompt = build_prompt(item)
-            article = call_gemini(prompt)
-
-            if tiene_wp:
-                try:
-                    generate_and_publish(item, article)
-                    print(f"✅ Borrador subido a WordPress: {item['title'][:50]}...")
-                except Exception as wp_err:
-                    print(f"⚠️ Error al subir a WP, guardando local: {wp_err}")
-                    save_draft(item, article)
-            else:
-                save_draft(item, article)
-
-        except Exception as e:
-            print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
-        time.sleep(8)
-
-    print("\n✅ Pipeline finalizado.")
 
 if __name__ == "__main__":
     main()
