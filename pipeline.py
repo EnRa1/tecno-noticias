@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo)
+Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo + Instagram)
 ==========================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las 3 mejores
 3. Extraccion del articulo completo desde la URL (trafilatura + readability)
 4. Redaccion con Gemini usando el articulo completo (con retry, keyword semantico)
+5. Generacion de imagen para Instagram + aviso a Make para publicar
 """
 
 import feedparser
@@ -21,6 +22,9 @@ from datetime import datetime, timezone, timedelta
 import trafilatura
 from readability import Document
 from bs4 import BeautifulSoup
+
+from generate_instagram_post import generate_post_image
+from publish_to_instagram import create_and_publish_instagram_post
 
 # ----------------------------------------------------------------------
 # CONFIGURACION
@@ -325,9 +329,9 @@ def rank_with_gemini(candidatos):
     Tu tarea es seleccionar las {MAX_ITEMS_PER_RUN} noticias MÁS RELEVANTES Y CON CONTEXTO de la siguiente lista.
 
     Criterios de selección (en orden de prioridad):
-    1. **Lanzamientos oficiales** de hardware (celulares, procesadores, GPU, etc.) o software.
+    1. **Lanzamientos oficiales** de hardware (celulares, procesadores, GPU, electrodomésticos, televisores, etcetera.) o software.
     2. **Avances reales en Inteligencia Artificial** (nuevos modelos, aplicaciones prácticas).
-    3. **Tecnología argentina** o que impacte directamente en Argentina.
+    3. **Noticias de empresas tecnológicas** (negociaciones, tratos, acuerdos, relaciones).
     4. **Ciberseguridad** (ataques reales, vulnerabilidades críticas).
     5. Ignora artículos de opinión, análisis retrospectivos, o rumores sin fuentes.
 
@@ -555,8 +559,6 @@ El cuerpo de la nota en Markdown (600-900 palabras), siguiendo ESTAS reglas:
 3. ENLACES:
    - Incluir al menos 1 ENLACE EXTERNO real hacia la fuente original:
      [texto del enlace]({item['link']})
-4. IMAGEN:
-   - Al final, sugeri un ALT_TEXT para la imagen destacada, de 8-12 palabras.
 
 ===========================================
 FORMATO DE SALIDA
@@ -633,6 +635,18 @@ def main():
                     save_draft(item, article)
             else:
                 save_draft(item, article)
+
+            # 4. Generar y publicar en Instagram (best-effort: si falla, no rompe el pipeline)
+            try:
+                imagen_portada = (full_article.get("top_image") if full_article else None)
+                if not imagen_portada:
+                    print("⚠️ Sin imagen de portada, se omite el post de Instagram.")
+                else:
+                    filename = f"{slugify(item['title'])}.png"
+                    image_path = generate_post_image(imagen_portada, item["title"], filename)
+                    create_and_publish_instagram_post(item, article, image_path)
+            except Exception as ig_err:
+                print(f"⚠️ No se pudo publicar en Instagram: {ig_err}")
 
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
