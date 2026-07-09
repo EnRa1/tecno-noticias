@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo + Instagram)
+Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo)
 ==========================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las 3 mejores
 3. Extraccion del articulo completo desde la URL (trafilatura + readability)
 4. Redaccion con Gemini usando el articulo completo (con retry, keyword semantico)
-5. Generacion de imagen para Instagram + aviso a Make para publicar
+
+La publicacion en Instagram NO ocurre aca. Se dispara por separado cuando
+el articulo se publica manualmente en WordPress (ver publish_from_wordpress.py
+y el workflow instagram_publish.yml).
 """
 
 import feedparser
@@ -22,9 +25,6 @@ from datetime import datetime, timezone, timedelta
 import trafilatura
 from readability import Document
 from bs4 import BeautifulSoup
-
-from generate_instagram_post import generate_post_image
-from publish_to_instagram import create_and_publish_instagram_post
 
 # ----------------------------------------------------------------------
 # CONFIGURACION
@@ -329,9 +329,9 @@ def rank_with_gemini(candidatos):
     Tu tarea es seleccionar las {MAX_ITEMS_PER_RUN} noticias MÁS RELEVANTES Y CON CONTEXTO de la siguiente lista.
 
     Criterios de selección (en orden de prioridad):
-    1. **Lanzamientos oficiales** de hardware (celulares, procesadores, GPU, electrodomésticos, televisores, etcetera.) o software.
+    1. **Lanzamientos oficiales** de hardware (celulares, procesadores, GPU, etc.) o software.
     2. **Avances reales en Inteligencia Artificial** (nuevos modelos, aplicaciones prácticas).
-    3. **Noticias de empresas tecnológicas** (negociaciones, tratos, acuerdos, relaciones).
+    3. **Tecnología argentina** o que impacte directamente en Argentina.
     4. **Ciberseguridad** (ataques reales, vulnerabilidades críticas).
     5. Ignora artículos de opinión, análisis retrospectivos, o rumores sin fuentes.
 
@@ -471,7 +471,7 @@ def build_prompt(item, full_text):
 
     return f"""Actua como un redactor SEO senior especializado en tecnologia,
 con dominio experto de los criterios de puntuacion de Rank Math para WordPress,
-escribiendo para el sitio tecno.ar.
+escribiendo para el sitio argentino tecno.ar.
 
 FUENTE DE REFERENCIA (USA ESTE TEXTO COMPLETO PARA REDACTAR, NO INVENTES DATOS):
 Titulo original: {item['title']}
@@ -530,6 +530,7 @@ PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
 ## SEO_TITLE
 Titulo de 50-60 caracteres. Reglas:
 - El focus keyword debe aparecer LO MAS CERCA POSIBLE DEL INICIO del titulo.
+- Incluir un numero O una power word (ej: "clave", "revolucionario", "oficial").
 
 ## SLUG
 version-corta-en-minusculas-con-guiones-del-focus-keyword
@@ -552,13 +553,15 @@ El cuerpo de la nota en Markdown (600-900 palabras), siguiendo ESTAS reglas:
    - NO copies frases textuales de la fuente; parafrasea completamente.
    - Agrega contexto, antecedentes o una perspectiva que no este en el resumen.
    - Evita frases genericas de relleno tipicas de IA.
-   - Voz activa, tono profesional pero cercano (espanol).
+   - Voz activa, tono profesional pero cercano (espanol rioplatense).
    - COHERENCIA: relee mentalmente cada oracion donde aparece el focus
      keyword y confirma que se entiende igual que el resto del texto,
      sin cortes abruptos de sintaxis.
 3. ENLACES:
    - Incluir al menos 1 ENLACE EXTERNO real hacia la fuente original:
      [texto del enlace]({item['link']})
+4. IMAGEN:
+   - Al final, sugeri un ALT_TEXT para la imagen destacada, de 8-12 palabras.
 
 ===========================================
 FORMATO DE SALIDA
@@ -603,10 +606,6 @@ def main():
         print("⚠️ No se encontró 'publish_to_wordpress'. Los borradores se guardarán LOCALMENTE.")
         tiene_wp = False
 
-    if items:
-        print(f"⏳ Esperando {DELAY_ENTRE_FASES}s antes de redactar (evitar rate limit)...")
-        time.sleep(DELAY_ENTRE_FASES)
-
     for item in items:
         print(f"\n📄 Procesando: {item['title'][:70]}...")
 
@@ -635,18 +634,6 @@ def main():
                     save_draft(item, article)
             else:
                 save_draft(item, article)
-
-            # 4. Generar y publicar en Instagram (best-effort: si falla, no rompe el pipeline)
-            try:
-                imagen_portada = (full_article.get("top_image") if full_article else None)
-                if not imagen_portada:
-                    print("⚠️ Sin imagen de portada, se omite el post de Instagram.")
-                else:
-                    filename = f"{slugify(item['title'])}.png"
-                    image_path = generate_post_image(imagen_portada, item["title"], filename)
-                    create_and_publish_instagram_post(item, article, image_path)
-            except Exception as ig_err:
-                print(f"⚠️ No se pudo publicar en Instagram: {ig_err}")
 
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
