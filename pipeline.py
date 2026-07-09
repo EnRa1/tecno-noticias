@@ -3,9 +3,9 @@
 Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo)
 ==========================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
-2. Filtro contextual con Gemini (1 sola llamada) -> elige las 3 mejores
+2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las 3 mejores
 3. Extraccion del articulo completo desde la URL (trafilatura + readability)
-4. Redaccion con Gemini usando el articulo completo (calidad superior)
+4. Redaccion con Gemini usando el articulo completo (con retry, keyword semantico)
 """
 
 import feedparser
@@ -40,6 +40,14 @@ GEMINI_URL = (
 
 MAX_ITEMS_PER_RUN = 3  # <--- REDUCIDO A 3 para no consumir cuota
 MAX_HOURS_OLD = 24
+
+# Pausa de seguridad entre la fase de ranking y la fase de redacción,
+# para no pisar el límite de requests-por-minuto de Gemini.
+DELAY_ENTRE_FASES = 15  # segundos
+
+# Reintentos ante rate limit (429) para cualquier llamada a Gemini.
+GEMINI_MAX_RETRIES = 4
+GEMINI_BASE_BACKOFF = 8  # segundos, crece exponencialmente: 8, 16, 32, 64...
 
 # Headers realistas para no ser bloqueado por medios (The Verge, TechCrunch, etc. filtran bots)
 REQUEST_HEADERS = {
@@ -246,7 +254,56 @@ def extract_full_article(url):
     return None
 
 # ----------------------------------------------------------------------
-# FILTRO CONTEXTUAL CON GEMINI (1 SOLA LLAMADA)
+# HELPER COMPARTIDO: LLAMADA A GEMINI CON RETRY/BACKOFF
+# ----------------------------------------------------------------------
+
+def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES):
+    """
+    Hace POST a Gemini con reintentos ante 429 (rate limit) y errores
+    transitorios de red (timeout, conexión). 'context' es solo para logs.
+    Devuelve el dict de la respuesta JSON si tiene éxito, o lanza excepción
+    si se agotan los reintentos.
+    """
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY")
+
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            resp = requests.post(GEMINI_URL, json=payload, timeout=60)
+
+            if resp.status_code == 200:
+                return resp.json()
+
+            elif resp.status_code == 429:
+                wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
+                print(f"[RATE LIMIT] {context}: intento {attempt + 1}/{retries}, esperando {wait}s...")
+                time.sleep(wait)
+                last_error = RuntimeError(f"429 rate limit tras {retries} intentos ({context})")
+                continue
+
+            elif resp.status_code >= 500:
+                wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
+                print(f"[SERVER ERROR] {context}: {resp.status_code}, esperando {wait}s...")
+                time.sleep(wait)
+                last_error = RuntimeError(f"Error {resp.status_code} tras {retries} intentos ({context})")
+                continue
+
+            else:
+                raise RuntimeError(f"Error Gemini {resp.status_code} ({context}): {resp.text[:300]}")
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
+            print(f"[NETWORK ERROR] {context}: {type(e).__name__}, esperando {wait}s...")
+            time.sleep(wait)
+            last_error = e
+            continue
+
+    raise RuntimeError(f"Se agotaron los reintentos en {context}: {last_error}")
+
+# ----------------------------------------------------------------------
+# FILTRO CONTEXTUAL CON GEMINI (1 SOLA LLAMADA, CON RETRY)
 # ----------------------------------------------------------------------
 
 def rank_with_gemini(candidatos):
@@ -257,7 +314,7 @@ def rank_with_gemini(candidatos):
         print("⚠️ Sin API Key, usando orden por reglas.")
         return candidatos
 
-    print(f"🧠 Enviando {len(candidatos)} noticias a Gemini para ranking contextual (1 sola llamada)...")
+    print(f"🧠 Enviando {len(candidatos)} noticias a Gemini para ranking contextual...")
 
     lista_texto = ""
     for idx, item in enumerate(candidatos, 1):
@@ -290,31 +347,27 @@ def rank_with_gemini(candidatos):
     }
 
     try:
-        resp = requests.post(GEMINI_URL, json=payload, timeout=60)
-        if resp.status_code == 200:
-            data = resp.json()
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-            result = json.loads(raw_text)
-            indices = result.get("seleccionados", [])
+        data = call_gemini_api(payload, context="ranking")
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        result = json.loads(raw_text)
+        indices = result.get("seleccionados", [])
 
-            if not indices:
-                print("⚠️ Gemini no devolvió índices, usando orden por reglas.")
-                return candidatos[:MAX_ITEMS_PER_RUN]
-
-            seleccionados = []
-            for i in indices:
-                if 1 <= i <= len(candidatos):
-                    seleccionados.append(candidatos[i - 1])
-                if len(seleccionados) >= MAX_ITEMS_PER_RUN:
-                    break
-
-            print(f"✅ Gemini seleccionó {len(seleccionados)} noticias por contexto.")
-            return seleccionados
-        else:
-            print(f"⚠️ Error en Gemini (ranking): {resp.status_code}, usando orden por reglas.")
+        if not indices:
+            print("⚠️ Gemini no devolvió índices, usando orden por reglas.")
             return candidatos[:MAX_ITEMS_PER_RUN]
+
+        seleccionados = []
+        for i in indices:
+            if 1 <= i <= len(candidatos):
+                seleccionados.append(candidatos[i - 1])
+            if len(seleccionados) >= MAX_ITEMS_PER_RUN:
+                break
+
+        print(f"✅ Gemini seleccionó {len(seleccionados)} noticias por contexto.")
+        return seleccionados
+
     except Exception as e:
-        print(f"⚠️ Excepción en Gemini (ranking): {e}, usando orden por reglas.")
+        print(f"⚠️ No se pudo rankear con Gemini ({e}), usando orden por reglas.")
         return candidatos[:MAX_ITEMS_PER_RUN]
 
 # ----------------------------------------------------------------------
@@ -414,7 +467,7 @@ def build_prompt(item, full_text):
 
     return f"""Actua como un redactor SEO senior especializado en tecnologia,
 con dominio experto de los criterios de puntuacion de Rank Math para WordPress,
-escribiendo para el sitio argentino tecno.ar.
+escribiendo para el sitio tecno.ar.
 
 FUENTE DE REFERENCIA (USA ESTE TEXTO COMPLETO PARA REDACTAR, NO INVENTES DATOS):
 Titulo original: {item['title']}
@@ -425,22 +478,54 @@ TEXTO COMPLETO DEL ARTICULO (basate en esto para redactar, sin inventar):
 {text_limit}
 
 ===========================================
-PASO 1: DEFINI EL FOCUS KEYWORD
+PASO 1: DEFINI EL FOCUS KEYWORD (REGLAS SEMANTICAS ESTRICTAS)
 ===========================================
-Elegi UN focus keyword principal (2-4 palabras, en espanol, con intencion de
-busqueda real, no generico) que represente el tema central de la noticia.
+El focus keyword NO es una etiqueta ni un hashtag: tiene que ser una frase
+que un lector diria en una oracion normal en español. Muchas veces la noticia
+tiene un producto con nombre propio + marca (ej: "GPT-Live" de "OpenAI",
+"Moto Tag 2" de "Motorola"). En esos casos, JAMAS encadenes los dos nombres
+propios uno al lado del otro sin conector, porque eso no es una frase real
+y despues no se puede insertar en el texto sin que quede forzado.
+
+EJEMPLOS DE KEYWORDS INCORRECTOS (rechazar siempre este patron):
+- "GPT-Live OpenAI"        -> mal: dos nombres propios pegados, no es una frase
+- "Apple Broadcom Chips"   -> mal: tres sustantivos en ingles sin conector
+- "Moto Tag 2 Motorola"    -> mal: producto + marca sin relacion gramatical
+
+EJEMPLOS DE KEYWORDS CORRECTOS PARA ESOS MISMOS CASOS:
+- "modo de voz de ChatGPT"        (en vez de "GPT-Live OpenAI")
+- "chips de Apple con Broadcom"   (en vez de "Apple Broadcom Chips")
+- "rastreador Moto Tag 2"         (en vez de "Moto Tag 2 Motorola";
+   aca "rastreador" es la categoria del producto, que SI se puede combinar
+   naturalmente con el nombre propio)
+
+REGLA GENERAL: si el nombre del producto ya es un sustantivo reconocible en
+español (rastreador, auriculares, procesador, modelo, chatbot, app, robot,
+notebook, etc.), combina ESA categoria con el nombre propio del producto.
+Si el nombre propio no tiene una categoria clara en el texto, arma una frase
+descriptiva de lo que HACE o ES la noticia (ej: "voz mas natural de ChatGPT",
+en vez de encadenar los dos nombres propios de la marca y el producto).
+
+CHECKLIST antes de definir el keyword final (verificalo vos mismo):
+1. ¿Se puede leer el keyword dentro de una oracion completa sin sonar
+   una lista de nombres propios pegados? Si no, reformulalo.
+2. ¿Tiene al menos una palabra funcional en español (de, con, para, en) que
+   conecte los sustantivos, salvo que sea una sola categoria + un nombre
+   propio (ej: "rastreador Moto Tag 2")? Si son 2+ nombres propios de marcas
+   o modelos distintos pegados sin conector, esta mal.
+3. ¿Es asi como lo diria un periodista argentino en voz alta? Si suena a
+   tag de metadata, esta mal.
 
 ===========================================
 PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
 ===========================================
 
 ## FOCUS_KEYWORD
-[el keyword elegido]
+[el keyword elegido, ya validado con el checklist de arriba]
 
 ## SEO_TITLE
 Titulo de 50-60 caracteres. Reglas:
 - El focus keyword debe aparecer LO MAS CERCA POSIBLE DEL INICIO del titulo.
-- Incluir un numero O una power word (ej: "clave", "revolucionario", "oficial").
 
 ## SLUG
 version-corta-en-minusculas-con-guiones-del-focus-keyword
@@ -455,14 +540,18 @@ El titulo visible del articulo. Debe incluir el focus keyword.
 ## ARTICULO
 El cuerpo de la nota en Markdown (600-900 palabras), siguiendo ESTAS reglas:
 1. ESTRUCTURA:
-   - El focus keyword debe aparecer en el PRIMER PARRAFO.
+   - El focus keyword debe aparecer en el PRIMER PARRAFO, integrado en una
+     oracion natural (nunca pegado como si fuera una etiqueta suelta).
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
    - Parrafos cortos: maximo 3-4 lineas cada uno.
 2. CONTENIDO:
    - NO copies frases textuales de la fuente; parafrasea completamente.
    - Agrega contexto, antecedentes o una perspectiva que no este en el resumen.
    - Evita frases genericas de relleno tipicas de IA.
-   - Voz activa, tono profesional pero cercano (espanol rioplatense).
+   - Voz activa, tono profesional pero cercano (espanol).
+   - COHERENCIA: relee mentalmente cada oracion donde aparece el focus
+     keyword y confirma que se entiende igual que el resto del texto,
+     sin cortes abruptos de sintaxis.
 3. ENLACES:
    - Incluir al menos 1 ENLACE EXTERNO real hacia la fuente original:
      [texto del enlace]({item['link']})
@@ -477,6 +566,23 @@ META_DESCRIPTION, H1, ARTICULO, ALT_TEXT) con esos encabezados exactos en
 Markdown. No agregues explicaciones fuera de esa estructura.
 Al final del ARTICULO, agrega: "Fuente: {item['source']}"
 """
+
+
+def call_gemini(prompt):
+    """
+    Redacta el artículo con Gemini, usando el helper compartido con
+    retry/backoff ante 429 y errores transitorios.
+    """
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
+
+    data = call_gemini_api(payload, context="redaccion")
+
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Respuesta inesperada de Gemini: {data}")
 
 # ----------------------------------------------------------------------
 # MAIN
@@ -494,6 +600,10 @@ def main():
     except ImportError:
         print("⚠️ No se encontró 'publish_to_wordpress'. Los borradores se guardarán LOCALMENTE.")
         tiene_wp = False
+
+    if items:
+        print(f"⏳ Esperando {DELAY_ENTRE_FASES}s antes de redactar (evitar rate limit)...")
+        time.sleep(DELAY_ENTRE_FASES)
 
     for item in items:
         print(f"\n📄 Procesando: {item['title'][:70]}...")
@@ -526,38 +636,13 @@ def main():
 
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
-        time.sleep(6)  # Pausa más larga para respetar límites
+        time.sleep(6)  # Pausa entre items para respetar límites
 
     print("\n✅ Pipeline finalizado.")
 
 # ----------------------------------------------------------------------
-# FUNCIONES RESTANTES (call_gemini, save_draft, etc.)
+# GUARDADO DE BORRADORES LOCALES
 # ----------------------------------------------------------------------
-
-def call_gemini(prompt, retries=3):
-    if not GEMINI_API_KEY:
-        raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY")
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
-
-    for attempt in range(retries):
-        resp = requests.post(GEMINI_URL, json=payload, timeout=60)
-        if resp.status_code == 200:
-            data = resp.json()
-            try:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            except (KeyError, IndexError):
-                raise RuntimeError(f"Respuesta inesperada de Gemini: {data}")
-        elif resp.status_code == 429:
-            wait = 2 ** attempt * 5
-            print(f"[RATE LIMIT] Esperando {wait}s antes de reintentar...")
-            time.sleep(wait)
-        else:
-            raise RuntimeError(f"Error Gemini {resp.status_code}: {resp.text}")
-
-    raise RuntimeError("Se agotaron los reintentos por rate limit (429).")
 
 def save_draft(item, article_md):
     DRAFTS_DIR.mkdir(exist_ok=True)
