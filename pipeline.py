@@ -42,8 +42,8 @@ GEMINI_URL = (
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
-MAX_ITEMS_PER_RUN = 3  # <--- REDUCIDO A 3 para no consumir cuota
-MAX_HOURS_OLD = 24
+MAX_ITEMS_PER_RUN = 4  # <--- REDUCIDO A 3 para no consumir cuota
+MAX_HOURS_OLD = 18
 
 # Pausa de seguridad entre la fase de ranking y la fase de redacción,
 # para no pisar el límite de requests-por-minuto de Gemini.
