@@ -271,7 +271,7 @@ def buscar_imagen_google(query, fallback_url=None):
         "searchType": "image",
         "num": 5,                    # traer 5 y elegir la mejor
         "imgSize": "large",          # imágenes grandes (mejor calidad para Instagram)
-        "imgType": "photo",           # tipo noticia, más relevante para tech
+        "imgType": "",           # tipo noticia, más relevante para tech
         "safe": "active",
         "fileType": "jpg",
     }
@@ -428,22 +428,92 @@ def rank_with_gemini(candidatos):
         lista_texto += f"{idx}. Título: {item['title']}\n   Resumen: {item['summary'][:250]}\n\n"
 
     prompt = f"""
-    Eres un editor jefe de un blog de tecnología llamado tecno.ar.
-    Tu tarea es seleccionar las {MAX_ITEMS_PER_RUN} noticias MÁS RELEVANTES Y CON CONTEXTO de la siguiente lista.
+Eres un editor jefe de un blog de tecnología llamado tecno.ar. Tu tarea es
+seleccionar las {MAX_ITEMS_PER_RUN} noticias MÁS RELEVANTES de la lista al final
+de este mensaje, aplicando los criterios de abajo EN ORDEN DE PRIORIDAD.
 
-    Criterios de selección (en orden de prioridad):
-    1. **Lanzamientos oficiales** de hardware (celulares, procesadores, GPU, televisores, wearables, gadgets, etc.) o software.
-    2. **Avances reales en Inteligencia Artificial** (nuevos modelos, aplicaciones prácticas).
-    3. **Empresas de Tecnología** (negociaciones, tratos, convenios).
-    4. **Ciberseguridad** (ataques reales, vulnerabilidades críticas).
-    5. Ignora artículos de opinión, análisis retrospectivos, o rumores sin fuentes.
+===========================================
+CRITERIO 1 (máxima prioridad): LANZAMIENTOS OFICIALES DE HARDWARE, SOFTWARE, WEARABLES, GADGETS, TECNOLOGÍA PARA EL HOGAR 
+===========================================
+Es la noticia PRIMARIA de un producto que sale al mercado, se anuncia
+oficialmente, o se actualiza con una versión nueva. La empresa fabricante
+o desarrolladora es quien hace el anuncio (no un tercero especulando).
 
-    Lista de noticias:
-    {lista_texto}
+ejemplos:
+- "Samsung presenta el Galaxy S26 con nuevo procesador propio"
+- "Apple lanza iOS 20 con rediseño completo de la interfaz"
+- "NVIDIA anuncia la nueva serie RTX 6000 para gaming"
 
-    Debes devolver SOLO un JSON con los números de los {MAX_ITEMS_PER_RUN} índices seleccionados, en orden de prioridad.
-    Formato exacto: {{"seleccionados": [3, 7, 12]}}
-    """
+
+===========================================
+CRITERIO 2: AVANCES REALES EN INTELIGENCIA ARTIFICIAL
+===========================================
+Modelos nuevos, funciones nuevas lanzadas, o aplicaciones prácticas ya
+disponibles. Debe ser un avance concreto y verificable, no una promesa a futuro
+ni una reflexión general sobre "el futuro de la IA".
+
+ejemplos:
+- "OpenAI lanza GPT-6 con capacidades de razonamiento mejoradas"
+- "Google integra Gemini directamente en Google Sheets"
+- "Anthropic presenta Claude con nueva función de memoria persistente"
+
+
+
+===========================================
+CRITERIO 3: EMPRESAS DE TECNOLOGÍA (negociaciones, tratos, convenios)
+===========================================
+Adquisiciones, fusiones, rondas de inversión, alianzas estratégicas o
+convenios comerciales concretos y confirmados entre empresas.
+
+ejemplos:
+- "Microsoft adquiere la startup de ciberseguridad XDR por USD 500 millones"
+- "Mercado Libre firma un convenio con Visa para pagos internacionales"
+- "Globant anuncia una ronda de inversión de USD 200 millones"
+
+
+===========================================
+CRITERIO 4 (mínima prioridad): CIBERSEGURIDAD
+===========================================
+Ataques reales ya ocurridos, vulnerabilidades críticas confirmadas (CVE,
+parches urgentes), o filtraciones de datos reales y verificadas.
+
+ejemplos:
+- "Ransomware ataca los servidores de una aerolínea europea"
+- "Descubren vulnerabilidad crítica en routers de Cisco, ya hay parche disponible"
+- "Filtración expone datos de 2 millones de usuarios de una app de delivery"
+
+
+===========================================
+CRITERIO DE DESCARTE (aplica a cualquier categoría, siempre)
+===========================================
+Ignorá SIEMPRE, sin importar el tema, artículos que sean:
+- Opinión o análisis retrospectivo ("por qué X importa", "lo que aprendimos de...")
+- Rumores, filtraciones o especulación sin confirmación oficial de la empresa
+- Rankings, resúmenes, "top 10", "lo mejor de la semana", roundups
+- Reviews de productos que ya llevan tiempo en el mercado (no son lanzamientos nuevos)
+
+===========================================
+CÓMO DECIDIR ENTRE VARIAS NOTICIAS DEL MISMO CRITERIO
+===========================================
+Si hay más candidatas de las que necesitás dentro de un mismo criterio,
+priorizá la que tenga: (a) confirmación oficial más directa de la empresa
+involucrada, (b) mayor impacto o alcance (una empresa grande y conocida
+pesa más que una startup poco conocida), (c) mayor actualidad (evento más
+reciente dentro de la ventana de tiempo).
+
+===========================================
+LISTA DE NOTICIAS A EVALUAR
+===========================================
+{lista_texto}
+
+===========================================
+FORMATO DE SALIDA (obligatorio)
+===========================================
+Devolvé SOLO un JSON con los números de los {MAX_ITEMS_PER_RUN} índices
+seleccionados, en orden de prioridad (el más relevante primero).
+No agregues texto explicativo antes ni después del JSON.
+Formato exacto: {{"seleccionados": [3, 7, 12]}}
+"""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -629,66 +699,115 @@ tiene un producto con nombre propio + marca (ej: "GPT-Live" de "OpenAI",
 propios uno al lado del otro sin conector, porque eso no es una frase real
 y despues no se puede insertar en el texto sin que quede forzado.
 
+REGLA CRITICA - EL KEYWORD NO PUEDE CONTENER YA EL SUJETO DE LA ORACION:
+Si el keyword incluye como sujeto la misma entidad que vas a usar de sujeto
+en la oracion, vas a generar una redundancia (sujeto repetido). Por ejemplo,
+si el keyword es "demanda de Apple a OpenAI por secretos comerciales" y
+armas la oracion "Apple ha iniciado una demanda de Apple a OpenAI...", eso
+es un ERROR GRAVE: el sujeto "Apple" aparece dos veces.
+Para evitarlo, el keyword debe estar formulado como un SUSTANTIVO/EVENTO
+autonomo que se pueda insertar como OBJETO o COMPLEMENTO de la oracion,
+no como una mini-oracion con sujeto propio. Ejemplos:
+- MAL como keyword: "Apple demanda a OpenAI por secretos comerciales"
+  (ya tiene sujeto + verbo, no se puede insertar sin generar redundancia)
+- BIEN como keyword: "demanda por secretos comerciales entre Apple y OpenAI"
+  (es un sustantivo/evento, se puede insertar como objeto de cualquier verbo)
+
 EJEMPLOS DE KEYWORDS INCORRECTOS (rechazar siempre este patron):
 - "GPT-Live OpenAI"        -> mal: dos nombres propios pegados, no es una frase
 - "Apple Broadcom Chips"   -> mal: tres sustantivos en ingles sin conector
 - "Moto Tag 2 Motorola"    -> mal: producto + marca sin relacion gramatical
+- "Apple demanda a OpenAI" -> mal: ya es una oracion con sujeto y verbo propios
 
-EJEMPLOS DE KEYWORDS CORRECTOS PARA ESOS MISMOS CASOS:
-- "modo de voz de ChatGPT"        (en vez de "GPT-Live OpenAI")
-- "chips de Apple con Broadcom"   (en vez de "Apple Broadcom Chips")
-- "rastreador Moto Tag 2"         (en vez de "Moto Tag 2 Motorola")
+EJEMPLOS DE KEYWORDS CORRECTOS:
+- "modo de voz de ChatGPT"                          (sustantivo + complementos)
+- "chips de Apple con Broadcom"                     (sustantivo + complementos)
+- "rastreador Moto Tag 2"                           (sustantivo + nombre propio)
+- "demanda por secretos comerciales entre Apple y OpenAI"  (evento como sustantivo)
 
-REGLA GENERAL: si el nombre del producto ya es un sustantivo reconocible en
-español (rastreador, auriculares, procesador, modelo, chatbot, app, robot,
-notebook, etc.), combina ESA categoria con el nombre propio del producto.
-
-CHECKLIST antes de definir el keyword final:
+CHECKLIST antes de definir el keyword final (las 4 deben dar SI):
 1. ¿Se puede leer el keyword dentro de una oracion completa sin sonar
    una lista de nombres propios pegados?
-2. ¿Tiene al menos una palabra funcional en español (de, con, para, en)?
+2. ¿Tiene al menos una palabra funcional en español (de, con, para, en, por, entre)?
 3. ¿Es asi como lo diria un periodista en voz alta?
+4. ¿El keyword es un SUSTANTIVO/EVENTO (no una oracion con sujeto+verbo propios),
+   de forma que se pueda insertar como objeto/complemento sin repetir el sujeto?
 
 ===========================================
 PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
 ===========================================
 
 ## FOCUS_KEYWORD
-[el keyword elegido (no debe variar, debe ser igual al elegido), ya validado con el checklist de arriba]
+[el keyword elegido, validado con el checklist de arriba. ESTE STRING EXACTO,
+caracter por caracter, es el que vas a repetir en SEO_TITLE, H1, en el primer
+parrafo del ARTICULO y en los demás si es necesario. No lo conjugues, no le cambies el orden de las palabras,
+no le agregues ni saques articulos. Es un string fijo que se copia y pega igual
+en cada instancia obligatoria.]
 
 ## SEO_TITLE
-Titulo de 50-60 caracteres. Reglas:
-- El focus keyword debe aparecer LO MAS CERCA POSIBLE DEL INICIO del titulo. (El keyword no debe variar dentro del artículo, debe permanecer igual)
+Titulo de 50-60 caracteres. El focus keyword (string identico al de arriba)
+debe aparecer lo mas cerca posible del inicio del titulo.
 
 ## SLUG
 version-corta-en-minusculas-con-guiones-del-focus-keyword
-(5-6 palabras maximo)
-Si la keyword tiene conectores, el slug tambien debe tener los conectores.
+(5-6 palabras maximo). Si el keyword tiene conectores (de, con, para, entre),
+el slug tambien debe conservarlos como guion (ej: entre-apple-y-openai).
 
 ## META_DESCRIPTION
-Entre 150 y 160 caracteres. Debe incluir el focus keyword (keyword debe permanecer igual al definido). NO colocar estos caracteres: ** **  
+Entre 150 y 160 caracteres. Debe incluir el focus keyword (string identico).
+NO usar asteriscos ni markdown de ningun tipo dentro de este campo.
 
 ## H1
-El titulo visible del articulo. Debe incluir el focus keyword (igual al keyword definido, no debe variar).
+El titulo visible del articulo. Debe incluir el focus keyword (string identico).
 
 ## ARTICULO
-El cuerpo de la nota en Markdown (600-900 palabras), siguiendo ESTAS reglas:
-1. ESTRUCTURA:
-   - El focus keyword debe aparecer en el PRIMER PARRAFO, integrado en una
-     oracion natural. (keyword debe permanecer igual al definido)
+El cuerpo de la nota en Markdown (600-900 palabras):
+
+1. PRIMERA MENCION DEL KEYWORD (la mas importante):
+   - Antes de escribir la oracion, preguntate: "¿el keyword ya trae su propio
+     sujeto y verbo?" Si es asi, NO uses ese mismo sujeto como sujeto de tu
+     oracion — usa un sujeto distinto, o reformula para que el keyword entre
+     como complemento/objeto.
+   - Ejemplo de integracion CORRECTA con keyword "demanda por secretos
+     comerciales entre Apple y OpenAI":
+     "La tensión entre gigantes tecnológicos escaló esta semana con una
+     [demanda por secretos comerciales entre Apple y OpenAI], presentada
+     ante un tribunal de California."
+   - Ejemplo de integracion INCORRECTA (sujeto duplicado):
+     "Apple ha iniciado una demanda de Apple a OpenAI por secretos..."
+   - El keyword debe aparecer como STRING EXACTO (mismas palabras, mismo
+     orden) dentro de una oracion que se lea 100% natural al leerla en voz alta.
+   - Releé la oracion completa antes de continuar: si suena repetitiva,
+     redundante, o forzada, reescribila desde cero cambiando el sujeto o
+     la estructura de la oracion, NUNCA cambiando el keyword.
+
+2. ESTRUCTURA:
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
    - Parrafos cortos: maximo 3-4 lineas cada uno.
-2. CONTENIDO:
+
+3. CONTENIDO:
    - NO copies frases textuales de la fuente; parafrasea completamente.
    - Evita frases genericas de relleno tipicas de IA.
-   - Voz activa, tono profesional pero cercano (espanol).
-   - COHERENCIA: relee mentalmente cada oracion donde aparece el focus
-     keyword y confirma que se entiende igual que el resto del texto.
-3. ENLACES:
-   - No se debe mencionar en el cuerpo del artículo el nombre de otros medios. Incluir al menos 1 ENLACE EXTERNO real hacia la fuente original (El enlace debe estar puesto cuando se mencione la palabra clave):
-     [texto del enlace]({item['link']})
-   {"- Incluir también 1 ENLACE a la fuente secundaria: [texto](" + fuente_secundaria['link'] + ")" if fuente_secundaria else ""}
+   - Voz activa, tono profesional pero cercano (español).
+   - No menciones en el cuerpo del articulo el nombre de otros medios/fuentes.
 
+4. ENLACES:
+   - El PRIMER enlace externo va exactamente sobre la mención del focus
+     keyword los últimos párrafos (el mismo lugar del punto 1), asi:
+     [{{el string exacto del keyword}}]({item['link']})
+   {"- Incluí un segundo enlace hacia la fuente secundaria, en otro punto del texto donde tenga sentido y relación a lo que se está hablando, asi: [texto natural](" + fuente_secundaria['link'] + ")" if fuente_secundaria else ""}
+
+===========================================
+VALIDACION FINAL OBLIGATORIA (haceła antes de responder)
+===========================================
+Antes de entregar la respuesta, verificá vos mismo:
+1. ¿El FOCUS_KEYWORD es idéntico, carácter por carácter, en SEO_TITLE, H1,
+   y en la primera mención dentro del ARTICULO? Si hay una sola diferencia
+   (singular/plural, orden de palabras, articulo agregado/sacado), corregilo.
+2. ¿La oración donde aparece el keyword por primera vez repite el mismo
+   sujeto dos veces? Si es así, reescribí la oración completa.
+3. ¿La oración suena como la diría un periodista al leerla en voz alta,
+   sin sonar forzada o robótica?
 
 ===========================================
 FORMATO DE SALIDA
