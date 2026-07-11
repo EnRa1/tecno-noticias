@@ -409,9 +409,9 @@ def rank_with_gemini(candidatos):
     Tu tarea es seleccionar las {MAX_ITEMS_PER_RUN} noticias MÁS RELEVANTES Y CON CONTEXTO de la siguiente lista.
 
     Criterios de selección (en orden de prioridad):
-    1. **Lanzamientos oficiales** de hardware (celulares, procesadores, GPU, etc.) o software.
+    1. **Lanzamientos oficiales** de hardware (celulares, procesadores, GPU, televisores, wearables, gadgets, etc.) o software.
     2. **Avances reales en Inteligencia Artificial** (nuevos modelos, aplicaciones prácticas).
-    3. **Tecnología argentina** o que impacte directamente en Argentina.
+    3. **Empresas de Tecnología** (negociaciones, tratos, convenios).
     4. **Ciberseguridad** (ataques reales, vulnerabilidades críticas).
     5. Ignora artículos de opinión, análisis retrospectivos, o rumores sin fuentes.
 
@@ -577,7 +577,7 @@ Resumen: {fuente_secundaria['summary']}
 
     return f"""Actua como un redactor SEO senior especializado en tecnologia,
 con dominio experto de los criterios de puntuacion de Rank Math para WordPress,
-escribiendo para el sitio argentino tecno.ar.
+escribiendo para el sitio tecno.ar.
 
 FUENTE PRINCIPAL (basate principalmente en este texto para redactar):
 Titulo original: {item['title']}
@@ -633,7 +633,6 @@ PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
 ## SEO_TITLE
 Titulo de 50-60 caracteres. Reglas:
 - El focus keyword debe aparecer LO MAS CERCA POSIBLE DEL INICIO del titulo.
-- Incluir un numero O una power word (ej: "clave", "revolucionario", "oficial").
 
 ## SLUG
 version-corta-en-minusculas-con-guiones-del-focus-keyword
@@ -656,7 +655,7 @@ El cuerpo de la nota en Markdown (600-900 palabras), siguiendo ESTAS reglas:
    - NO copies frases textuales de la fuente; parafrasea completamente.
    - Agrega contexto, antecedentes o una perspectiva que no este en el resumen.
    - Evita frases genericas de relleno tipicas de IA.
-   - Voz activa, tono profesional pero cercano (espanol rioplatense).
+   - Voz activa, tono profesional pero cercano (espanol).
    - COHERENCIA: relee mentalmente cada oracion donde aparece el focus
      keyword y confirma que se entiende igual que el resto del texto.
 3. ENLACES:
