@@ -19,7 +19,6 @@ import time
 import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 
 import trafilatura
 from readability import Document
@@ -52,8 +51,10 @@ GEMINI_MAX_RETRIES = 4
 GEMINI_BASE_BACKOFF = 8
 
 # Umbral de similitud para considerar que dos noticias cubren el mismo tema.
-# 0.35 = bastante permisivo (temas relacionados), 0.55 = mas estricto (casi identicos).
-SIMILITUD_MINIMA = 0.40
+# Ahora se calcula con Jaccard sobre palabras clave (no diff de caracteres),
+# asi que los valores tipicos son mas bajos que antes.
+# 0.15 = permisivo (temas relacionados), 0.30 = mas estricto (casi identicos).
+SIMILITUD_MINIMA = 0.18
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -68,6 +69,13 @@ KEYWORDS = [
     "inteligencia artificial", "ai", "ciberseguridad", "seguridad informatica",
     "software", "hardware", "app", "smartphone", "google", "microsoft",
     "apple", "startup", "tecnologia", "internet", "nube", "cloud",
+]
+
+STOPWORDS_ES = {
+    "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "al",
+    "y", "o", "que", "en", "con", "por", "para", "su", "sus", "es", "se",
+    "a", "como", "mas", "más", "sobre", "tras", "ya", "no", "lo", "le", "les",
+    "esta", "está", "este", "esa", "ese", "sin", "hay", "fue", "son", "ser",
 ]
 
 # ----------------------------------------------------------------------
@@ -102,9 +110,25 @@ def slugify(text):
     text = re.sub(r"[^\w\s-]", "", text.lower())
     return re.sub(r"[\s_-]+", "-", text).strip("-")[:60]
 
+def tokenizar(texto):
+    """Extrae palabras clave relevantes de un texto, sacando stopwords y palabras cortas."""
+    palabras = re.findall(r"[a-záéíóúñ0-9]+", texto.lower())
+    return {p for p in palabras if p not in STOPWORDS_ES and len(p) > 2}
+
 def similitud_texto(a, b):
-    """Calcula similitud entre dos strings (0.0 a 1.0) usando SequenceMatcher."""
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+    """
+    Calcula similitud entre dos strings (0.0 a 1.0) usando el indice de Jaccard
+    sobre palabras clave. Es mas robusto que un diff de caracteres (SequenceMatcher)
+    porque dos notas que cubren el mismo hecho con redaccion distinta van a compartir
+    las palabras clave (nombres propios, terminos tecnicos) aunque el orden y la
+    redaccion sean completamente diferentes.
+    """
+    set_a, set_b = tokenizar(a), tokenizar(b)
+    if not set_a or not set_b:
+        return 0.0
+    interseccion = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return interseccion / union if union else 0.0
 
 # ----------------------------------------------------------------------
 # FILTRO POR FECHA
@@ -191,7 +215,7 @@ def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
     """
     Busca entre todos los candidatos una segunda nota que cubra el mismo
     tema que el item principal, de una fuente distinta.
-    Usa similitud de título + resumen como criterio.
+    Usa similitud Jaccard de palabras clave (titulo + resumen) como criterio.
     Devuelve el candidato más similar (si supera el umbral) o None.
     """
     texto_principal = item_principal["title"] + " " + item_principal["summary"]
@@ -232,7 +256,8 @@ def buscar_imagen_google(query, fallback_url=None):
     Devuelve la URL de la primera imagen encontrada, o fallback_url si falla.
     """
     if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
-        print("⚠️ Sin credenciales de Google Search, usando imagen de la fuente original.")
+        print("⚠️ Sin credenciales de Google Search (revisar env vars del workflow), "
+              "usando imagen de la fuente original.")
         return fallback_url
 
     # Limitar el query a las primeras palabras más relevantes para mayor precisión
@@ -257,13 +282,11 @@ def buscar_imagen_google(query, fallback_url=None):
             items = resp.json().get("items", [])
             if items:
                 # Elegir la primera que no sea un logo pequeño
-                # (los logos suelen tener width/height muy chicos)
                 for item in items:
                     image_info = item.get("image", {})
                     width = image_info.get("width", 0)
                     height = image_info.get("height", 0)
                     url = item.get("link", "")
-                    # Descartar imágenes muy pequeñas (probable logo o ícono)
                     if width >= 400 and height >= 300 and url:
                         print(f"✅ Imagen encontrada: {url[:80]}")
                         return url
@@ -273,7 +296,7 @@ def buscar_imagen_google(query, fallback_url=None):
                     print(f"✅ Imagen encontrada (sin filtro de tamaño): {primera_url[:80]}")
                     return primera_url
         else:
-            print(f"⚠️ Error Google Search API: {resp.status_code}")
+            print(f"⚠️ Error Google Search API: {resp.status_code} — {resp.text[:200]}")
     except Exception as e:
         print(f"⚠️ Excepción buscando imagen: {e}")
 
@@ -463,6 +486,7 @@ MAX_POR_FUENTE = max(1, MAX_ITEMS_PER_RUN // 2)
 def fetch_new_relevant_items():
     seen = load_seen()
     candidatos = []
+    candidatos_para_triangular = []  # pool amplio, sin filtro de score_reglas>=3
 
     for url in load_feeds():
         try:
@@ -485,10 +509,7 @@ def fetch_new_relevant_items():
             texto_completo = entry.get("title", "") + " " + entry.get("summary", "")
             score_reglas, categoria_reglas = compute_relevance_score(texto_completo)
 
-            if score_reglas < 3:
-                continue
-
-            candidatos.append({
+            item_data = {
                 "hash": h,
                 "title": entry.get("title", "Sin titulo"),
                 "link": entry.get("link", ""),
@@ -497,15 +518,22 @@ def fetch_new_relevant_items():
                 "published": entry.get("published", ""),
                 "score_reglas": score_reglas,
                 "categoria_reglas": categoria_reglas,
-            })
+            }
 
-    print(f"📰 Noticias que pasaron el filtro rapido: {len(candidatos)}")
+            # Pool amplio para triangulacion: cualquier nota relevante y reciente,
+            # aunque no llegue al score minimo de seleccion.
+            candidatos_para_triangular.append(item_data)
+
+            if score_reglas < 3:
+                continue
+
+            candidatos.append(item_data)
+
+    print(f"📰 Noticias que pasaron el filtro rapido: {len(candidatos)} "
+          f"(pool de triangulación: {len(candidatos_para_triangular)})")
 
     if not candidatos:
         return [], []
-
-    # Guardamos todos los candidatos para la triangulacion posterior
-    todos_los_candidatos = candidatos.copy()
 
     if len(candidatos) > 30:
         candidatos.sort(key=lambda x: x["score_reglas"], reverse=True)
@@ -537,8 +565,8 @@ def fetch_new_relevant_items():
     for it in seleccionados_final:
         print(f"  [{it['score_reglas']:>2}pts | {it['categoria_reglas']:<9}] {it['title'][:70]}")
 
-    # Devolvemos también todos_los_candidatos para poder triangular después
-    return seleccionados_final, todos_los_candidatos
+    # Devolvemos el pool AMPLIO para triangular, no solo los que pasaron score>=3
+    return seleccionados_final, candidatos_para_triangular
 
 # ----------------------------------------------------------------------
 # CONSTRUCCION DEL PROMPT (con soporte para fuente secundaria)
@@ -548,7 +576,6 @@ def build_prompt(item, full_text_principal, fuente_secundaria=None,
                  full_text_secundario=None, imagen_url=None):
     text_limit = full_text_principal[:6000] if full_text_principal else item['summary']
 
-    # Si hay fuente secundaria, le pasamos su contenido a Gemini también
     bloque_secundario = ""
     if fuente_secundaria and full_text_secundario:
         text_sec = full_text_secundario[:3000]
@@ -562,7 +589,6 @@ URL: {fuente_secundaria['link']}
 {text_sec}
 """
     elif fuente_secundaria:
-        # Llegó el item pero no se pudo extraer el texto completo
         bloque_secundario = f"""
 FUENTE SECUNDARIA (resumen del RSS, no se pudo extraer el artículo completo):
 Título: {fuente_secundaria['title']}
@@ -687,23 +713,44 @@ def call_gemini(prompt):
         raise RuntimeError(f"Respuesta inesperada de Gemini: {data}")
 
 # ----------------------------------------------------------------------
+# GUARDADO DE BORRADORES LOCALES
+# ----------------------------------------------------------------------
+
+def save_draft(item, article_md, imagen_url=None):
+    """
+    Guarda el borrador en drafts/. El header incluye la URL de la imagen
+    encontrada por Google Custom Search (o fallback de la fuente original),
+    para que publish_to_wordpress.py pueda descargarla y subirla como
+    imagen destacada en el step siguiente del workflow.
+    """
+    DRAFTS_DIR.mkdir(exist_ok=True)
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    filename = f"{date_str}_{slugify(item['title'])}.md"
+    path = DRAFTS_DIR / filename
+
+    header = (
+        f"<!--\n"
+        f"ESTADO: borrador sin revisar - NO publicar directo\n"
+        f"Fuente original: {item['link']}\n"
+        f"Imagen sugerida: {imagen_url or ''}\n"
+        f"Fecha generacion: {datetime.now().isoformat()}\n"
+        f"-->\n\n"
+    )
+    path.write_text(header + article_md, encoding="utf-8")
+    print(f"[OK] Borrador guardado localmente: {path}")
+
+# ----------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------
 
 def main():
     print("🚀 Iniciando pipeline Hybrid 2.0 con triangulacion de fuentes e imagen IA...")
+    print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
+    print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
+    print(f"DEBUG: GOOGLE_SEARCH_ENGINE_ID {'OK' if GOOGLE_SEARCH_ENGINE_ID else 'FALTA'}")
 
-    # fetch_new_relevant_items ahora devuelve dos listas
     items, todos_los_candidatos = fetch_new_relevant_items()
     print(f"Encontrados {len(items)} items nuevos para procesar.")
-
-    try:
-        from publish_to_wordpress import generate_and_publish
-        tiene_wp = True
-        print("✅ Integración con WordPress activada.")
-    except ImportError:
-        print("⚠️ No se encontró 'publish_to_wordpress'. Los borradores se guardarán LOCALMENTE.")
-        tiene_wp = False
 
     if items:
         print(f"⏳ Esperando {DELAY_ENTRE_FASES}s antes de redactar (evitar rate limit)...")
@@ -750,16 +797,7 @@ def main():
                 imagen_url=imagen_url,
             )
             article = call_gemini(prompt)
-
-            if tiene_wp:
-                try:
-                    generate_and_publish(item, article)
-                    print(f"✅ Borrador subido a WordPress: {item['title'][:50]}...")
-                except Exception as wp_err:
-                    print(f"⚠️ Error al subir a WP, guardando local: {wp_err}")
-                    save_draft(item, article)
-            else:
-                save_draft(item, article)
+            save_draft(item, article, imagen_url=imagen_url)
 
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
@@ -767,26 +805,6 @@ def main():
         time.sleep(6)
 
     print("\n✅ Pipeline finalizado.")
-
-# ----------------------------------------------------------------------
-# GUARDADO DE BORRADORES LOCALES
-# ----------------------------------------------------------------------
-
-def save_draft(item, article_md):
-    DRAFTS_DIR.mkdir(exist_ok=True)
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    filename = f"{date_str}_{slugify(item['title'])}.md"
-    path = DRAFTS_DIR / filename
-
-    header = (
-        f"<!--\n"
-        f"ESTADO: borrador sin revisar - NO publicar directo\n"
-        f"Fuente original: {item['link']}\n"
-        f"Fecha generacion: {datetime.now().isoformat()}\n"
-        f"-->\n\n"
-    )
-    path.write_text(header + article_md, encoding="utf-8")
-    print(f"[OK] Borrador guardado localmente: {path}")
 
 if __name__ == "__main__":
     main()
