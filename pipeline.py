@@ -44,8 +44,8 @@ GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY")
 GOOGLE_SEARCH_ENGINE_ID = os.environ.get("GOOGLE_SEARCH_ENGINE_ID")
 GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
 
-MAX_ITEMS_PER_RUN = 3
-MAX_HOURS_OLD = 24
+MAX_ITEMS_PER_RUN = 4
+MAX_HOURS_OLD = 16
 DELAY_ENTRE_FASES = 15
 GEMINI_MAX_RETRIES = 4
 GEMINI_BASE_BACKOFF = 8
@@ -428,7 +428,7 @@ def rank_with_gemini(candidatos):
         lista_texto += f"{idx}. Título: {item['title']}\n   Resumen: {item['summary'][:250]}\n\n"
 
     prompt = f"""
-    Eres un editor jefe de un blog de tecnología llamado tecno.ar, con audiencia argentina.
+    Eres un editor jefe de un blog de tecnología llamado tecno.ar.
     Tu tarea es seleccionar las {MAX_ITEMS_PER_RUN} noticias MÁS RELEVANTES Y CON CONTEXTO de la siguiente lista.
 
     Criterios de selección (en orden de prioridad):
@@ -654,7 +654,7 @@ PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
 ===========================================
 
 ## FOCUS_KEYWORD
-[el keyword elegido, ya validado con el checklist de arriba]
+[el keyword elegido (no debe variar, debe ser igual al elegido), ya validado con el checklist de arriba]
 
 ## SEO_TITLE
 Titulo de 50-60 caracteres. Reglas:
@@ -662,19 +662,20 @@ Titulo de 50-60 caracteres. Reglas:
 
 ## SLUG
 version-corta-en-minusculas-con-guiones-del-focus-keyword
-(3-5 palabras maximo)
+(5-6 palabras maximo)
+Si la keyword tiene conectores, el slug tambien debe tener los conectores.
 
 ## META_DESCRIPTION
-Entre 150 y 160 caracteres. Debe incluir el focus keyword (debe permanecer igual al definido). NO colocar estos caracteres: ** **  
+Entre 150 y 160 caracteres. Debe incluir el focus keyword (keyword debe permanecer igual al definido). NO colocar estos caracteres: ** **  
 
 ## H1
-El titulo visible del articulo. Debe incluir el focus keyword (igual al definido, no debe variar).
+El titulo visible del articulo. Debe incluir el focus keyword (igual al keyword definido, no debe variar).
 
 ## ARTICULO
 El cuerpo de la nota en Markdown (600-900 palabras), siguiendo ESTAS reglas:
 1. ESTRUCTURA:
    - El focus keyword debe aparecer en el PRIMER PARRAFO, integrado en una
-     oracion natural. (debe permanecer igual al definido)
+     oracion natural. (keyword debe permanecer igual al definido)
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
    - Parrafos cortos: maximo 3-4 lineas cada uno.
 2. CONTENIDO:
