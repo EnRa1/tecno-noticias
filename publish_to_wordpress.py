@@ -1,13 +1,13 @@
 """
-si
 Publicador a WordPress para tecno.ar
 ======================================
 Toma los borradores generados por pipeline.py (carpeta drafts/), los parsea,
-y los sube a WordPress como POSTS EN ESTADO "draft" (borrador).
+descarga la imagen sugerida y los sube a WordPress como POSTS EN ESTADO
+"draft" (borrador), con esa imagen como destacada.
 
 IMPORTANTE: nunca publica directo. El estado siempre queda en "draft" para
-que un editor humano revise, ajuste, agregue la imagen destacada y el enlace
-interno real, y recien ahi le de "Publicar" desde el propio WordPress.
+que un editor humano revise, ajuste, y recien ahi le de "Publicar" desde el
+propio WordPress.
 
 Requisitos:
     pip install requests markdown --break-system-packages
@@ -51,6 +51,11 @@ def save_uploaded(uploaded):
     UPLOADED_FILE.write_text(json.dumps(uploaded, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def slugify(text):
+    text = re.sub(r"[^\w\s-]", "", text.lower())
+    return re.sub(r"[\s_-]+", "-", text).strip("-")[:60]
+
+
 def extract_field(text, field_name, next_fields):
     """
     Extrae el contenido entre '## FIELD_NAME' y el siguiente '## ' conocido.
@@ -80,7 +85,65 @@ def parse_draft(md_text):
 
 
 # ----------------------------------------------------------------------
-# WORDPRESS API
+# WORDPRESS API — IMAGEN
+# ----------------------------------------------------------------------
+
+def upload_image_to_wp(image_url, alt_text, filename_hint="imagen"):
+    """
+    Descarga una imagen desde una URL y la sube a la biblioteca de medios
+    de WordPress. Devuelve el media ID, o None si falla o no hay URL.
+    """
+    if not image_url:
+        print("  ℹ️ No hay URL de imagen sugerida, se omite la subida de imagen.")
+        return None
+
+    auth = (WP_USER, WP_APP_PASSWORD)
+    try:
+        img_resp = requests.get(
+            image_url, timeout=20,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; tecno.ar-bot)"},
+        )
+        img_resp.raise_for_status()
+
+        content_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+        ext_map = {
+            "image/jpeg": "jpg", "image/jpg": "jpg",
+            "image/png": "png", "image/webp": "webp",
+        }
+        ext = ext_map.get(content_type, "jpg")
+        filename = f"{slugify(filename_hint) or 'imagen'}.{ext}"
+
+        media_resp = requests.post(
+            f"{WP_URL}/wp-json/wp/v2/media",
+            data=img_resp.content,
+            auth=auth,
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Type": content_type,
+            },
+            timeout=30,
+        )
+
+        if media_resp.status_code in (200, 201):
+            media_id = media_resp.json()["id"]
+            print(f"  ✅ Imagen subida a WP (media ID {media_id})")
+            if alt_text:
+                requests.post(
+                    f"{WP_URL}/wp-json/wp/v2/media/{media_id}",
+                    json={"alt_text": alt_text},
+                    auth=auth, timeout=15,
+                )
+            return media_id
+
+        print(f"  ⚠️ Error subiendo imagen a WP: {media_resp.status_code} {media_resp.text[:200]}")
+    except Exception as e:
+        print(f"  ⚠️ Excepción subiendo imagen: {e}")
+
+    return None
+
+
+# ----------------------------------------------------------------------
+# WORDPRESS API — TAGS Y POST
 # ----------------------------------------------------------------------
 
 def get_or_create_tag(auth, tag_name):
@@ -103,17 +166,16 @@ def get_or_create_tag(auth, tag_name):
     return None
 
 
-def create_draft_post(fields, source_url):
+def create_draft_post(fields, source_url, featured_media=None):
     auth = (WP_USER, WP_APP_PASSWORD)
 
     html_content = md.markdown(fields["ARTICULO"])
 
-    # Nota de revision al principio del contenido, bien visible para el editor.
     review_note = (
         f'<p style="background:#fff3cd;border:1px solid #ffc107;padding:10px;">'
         f"<strong>Borrador generado automaticamente.</strong> Revisar antes de publicar: "
-        f"reemplazar el enlace interno sugerido, agregar imagen destacada con el "
-        f"ALT_TEXT sugerido, y verificar el focus keyword en Rank Math.<br>"
+        f"reemplazar el enlace interno sugerido, confirmar la imagen destacada, "
+        f"y verificar el focus keyword en Rank Math.<br>"
         f"<strong>Focus keyword sugerido:</strong> {fields['FOCUS_KEYWORD']}<br>"
         f"<strong>Alt text sugerido para la imagen:</strong> {fields['ALT_TEXT']}<br>"
         f'<strong>Fuente original:</strong> <a href="{source_url}">{source_url}</a>'
@@ -128,11 +190,12 @@ def create_draft_post(fields, source_url):
         "status": "draft",
     }
 
+    if featured_media:
+        payload["featured_media"] = featured_media
+
     # Intento best-effort de setear los campos nativos de Rank Math.
     # Esto SOLO funciona si tu instalacion de Rank Math expone esos meta
-    # keys via REST (no todas las versiones lo hacen por defecto). Si no
-    # funciona, no rompe nada: el post igual se crea, solo sin esos metadatos
-    # precargados, y los completas a mano en el editor (30 segundos).
+    # keys via REST. Si no funciona, no rompe nada: el post igual se crea.
     payload["meta"] = {
         "rank_math_focus_keyword": fields["FOCUS_KEYWORD"],
         "rank_math_description": fields["META_DESCRIPTION"],
@@ -153,7 +216,30 @@ def create_draft_post(fields, source_url):
 
 
 # ----------------------------------------------------------------------
-# MAIN
+# PUNTO DE ENTRADA REUTILIZABLE (por si otro script quiere llamarlo directo)
+# ----------------------------------------------------------------------
+
+def generate_and_publish(item, article_md, imagen_url=None):
+    """
+    Parsea el markdown de un articulo ya redactado, sube la imagen (si hay)
+    y crea el post como borrador en WordPress. item debe tener al menos 'link'.
+    """
+    if not all([WP_URL, WP_USER, WP_APP_PASSWORD]):
+        raise RuntimeError("Faltan variables de entorno: WP_URL, WP_USER, WP_APP_PASSWORD")
+
+    fields = parse_draft(article_md)
+    if not fields.get("ARTICULO"):
+        raise RuntimeError("No se pudo parsear el contenido generado por Gemini")
+
+    media_id = upload_image_to_wp(
+        imagen_url, fields.get("ALT_TEXT", ""), filename_hint=fields.get("SLUG", "imagen")
+    )
+
+    return create_draft_post(fields, item["link"], featured_media=media_id)
+
+
+# ----------------------------------------------------------------------
+# MAIN — lee los borradores locales de drafts/ y los sube
 # ----------------------------------------------------------------------
 
 def main():
@@ -177,9 +263,13 @@ def main():
 
         text = path.read_text(encoding="utf-8")
 
-        # Extraer la URL de la fuente original desde el comentario HTML inicial
+        # Extraer la URL de la fuente original y la imagen sugerida
+        # desde el comentario HTML inicial que escribe pipeline.py
         source_match = re.search(r"Fuente original: (\S+)", text)
         source_url = source_match.group(1) if source_match else ""
+
+        imagen_match = re.search(r"Imagen sugerida: (\S+)", text)
+        imagen_url = imagen_match.group(1) if imagen_match else None
 
         fields = parse_draft(text)
 
@@ -188,7 +278,11 @@ def main():
             continue
 
         try:
-            result = create_draft_post(fields, source_url)
+            print(f"📤 Subiendo: {key}")
+            media_id = upload_image_to_wp(
+                imagen_url, fields.get("ALT_TEXT", ""), filename_hint=fields.get("SLUG", key)
+            )
+            result = create_draft_post(fields, source_url, featured_media=media_id)
             print(f"[OK] Subido como borrador: {result.get('link', result.get('id'))}")
             uploaded[key] = {"wp_id": result.get("id"), "wp_link": result.get("link")}
             subidos += 1
