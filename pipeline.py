@@ -271,7 +271,7 @@ def buscar_imagen_google(query, fallback_url=None):
         "searchType": "image",
         "num": 5,                    # traer 5 y elegir la mejor
         "imgSize": "large",          # imágenes grandes (mejor calidad para Instagram)
-        "imgType": "news",           # tipo noticia, más relevante para tech
+        "imgType": "photo",           # tipo noticia, más relevante para tech
         "safe": "active",
         "fileType": "jpg",
     }
