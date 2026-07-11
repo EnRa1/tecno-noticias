@@ -617,7 +617,7 @@ TEXTO COMPLETO DEL ARTICULO PRINCIPAL:
 ===========================================
 INSTRUCCIONES DE REDACCION CON FUENTES MULTIPLES
 ===========================================
-{"Tenés DOS fuentes sobre el mismo tema. Usá ambas para: (1) cruzar datos y mencionar si coinciden o difieren, (2) agregar perspectivas o detalles que solo tenga una de las dos, (3) citar a los dos medios en el texto cuando corresponda. NO copies frases textuales de ninguna fuente." if bloque_secundario else "Redactá basándote en la fuente principal, parafraseando completamente y agregando contexto."}
+{"Tenés DOS fuentes sobre el mismo tema. Usá ambas para: (1) cruzar datos, (2) agregar perspectivas o detalles que solo tenga una de las dos. NO copies frases textuales de ninguna fuente." if bloque_secundario else "Redactá basándote en la fuente principal, parafraseando completamente y agregando contexto."}
 
 ===========================================
 PASO 1: DEFINI EL FOCUS KEYWORD (REGLAS SEMANTICAS ESTRICTAS)
@@ -647,7 +647,7 @@ CHECKLIST antes de definir el keyword final:
 1. ¿Se puede leer el keyword dentro de una oracion completa sin sonar
    una lista de nombres propios pegados?
 2. ¿Tiene al menos una palabra funcional en español (de, con, para, en)?
-3. ¿Es asi como lo diria un periodista argentino en voz alta?
+3. ¿Es asi como lo diria un periodista en voz alta?
 
 ===========================================
 PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
@@ -658,38 +658,36 @@ PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
 
 ## SEO_TITLE
 Titulo de 50-60 caracteres. Reglas:
-- El focus keyword debe aparecer LO MAS CERCA POSIBLE DEL INICIO del titulo.
+- El focus keyword debe aparecer LO MAS CERCA POSIBLE DEL INICIO del titulo. (El keyword no debe variar dentro del artículo, debe permanecer igual)
 
 ## SLUG
 version-corta-en-minusculas-con-guiones-del-focus-keyword
 (3-5 palabras maximo)
 
 ## META_DESCRIPTION
-Entre 150 y 160 caracteres. Debe incluir el focus keyword.
+Entre 150 y 160 caracteres. Debe incluir el focus keyword (debe permanecer igual al definido). NO colocar estos caracteres: ** **  
 
 ## H1
-El titulo visible del articulo. Debe incluir el focus keyword.
+El titulo visible del articulo. Debe incluir el focus keyword (igual al definido, no debe variar).
 
 ## ARTICULO
 El cuerpo de la nota en Markdown (600-900 palabras), siguiendo ESTAS reglas:
 1. ESTRUCTURA:
    - El focus keyword debe aparecer en el PRIMER PARRAFO, integrado en una
-     oracion natural.
+     oracion natural. (debe permanecer igual al definido)
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
    - Parrafos cortos: maximo 3-4 lineas cada uno.
 2. CONTENIDO:
    - NO copies frases textuales de la fuente; parafrasea completamente.
-   - Agrega contexto, antecedentes o una perspectiva que no este en el resumen.
    - Evita frases genericas de relleno tipicas de IA.
    - Voz activa, tono profesional pero cercano (espanol).
    - COHERENCIA: relee mentalmente cada oracion donde aparece el focus
      keyword y confirma que se entiende igual que el resto del texto.
 3. ENLACES:
-   - Incluir al menos 1 ENLACE EXTERNO real hacia la fuente original:
+   - No se debe mencionar en el cuerpo del artículo el nombre de otros medios. Incluir al menos 1 ENLACE EXTERNO real hacia la fuente original (El enlace debe estar puesto cuando se mencione la palabra clave):
      [texto del enlace]({item['link']})
    {"- Incluir también 1 ENLACE a la fuente secundaria: [texto](" + fuente_secundaria['link'] + ")" if fuente_secundaria else ""}
-4. IMAGEN:
-   - Al final, sugeri un ALT_TEXT para la imagen destacada, de 8-12 palabras.
+
 
 ===========================================
 FORMATO DE SALIDA
