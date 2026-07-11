@@ -11,4 +11,5 @@ https://www.xataka.com/feedburner.xml
 https://www.genbeta.com/feedburner.xml
 https://hipertextual.com/feed
 https://openai.com/news/rss.xml
+https://www.engadget.com/rss.xml
 
