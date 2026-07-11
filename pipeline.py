@@ -76,7 +76,7 @@ STOPWORDS_ES = {
     "y", "o", "que", "en", "con", "por", "para", "su", "sus", "es", "se",
     "a", "como", "mas", "más", "sobre", "tras", "ya", "no", "lo", "le", "les",
     "esta", "está", "este", "esa", "ese", "sin", "hay", "fue", "son", "ser",
-]
+}
 
 # ----------------------------------------------------------------------
 # UTILIDADES
