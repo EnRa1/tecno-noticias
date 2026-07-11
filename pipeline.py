@@ -4,12 +4,10 @@ Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo)
 ==========================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las 3 mejores
-3. Extraccion del articulo completo desde la URL (trafilatura + readability)
-4. Redaccion con Gemini usando el articulo completo (con retry, keyword semantico)
-
-La publicacion en Instagram NO ocurre aca. Se dispara por separado cuando
-el articulo se publica manualmente en WordPress (ver publish_from_wordpress.py
-y el workflow instagram_publish.yml).
+3. Triangulacion de fuentes: busca una segunda nota sobre el mismo tema
+4. Extraccion del articulo completo desde ambas fuentes (trafilatura + readability)
+5. Busqueda de imagen relevante via Google Custom Search API
+6. Redaccion con Gemini usando contenido triangulado (con retry, keyword semantico)
 """
 
 import feedparser
@@ -20,7 +18,8 @@ import re
 import time
 import hashlib
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
 
 import trafilatura
 from readability import Document
@@ -42,18 +41,20 @@ GEMINI_URL = (
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
-MAX_ITEMS_PER_RUN = 4  # <--- REDUCIDO A 3 para no consumir cuota
-MAX_HOURS_OLD = 18
+GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY")
+GOOGLE_SEARCH_ENGINE_ID = os.environ.get("GOOGLE_SEARCH_ENGINE_ID")
+GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
 
-# Pausa de seguridad entre la fase de ranking y la fase de redacción,
-# para no pisar el límite de requests-por-minuto de Gemini.
-DELAY_ENTRE_FASES = 15  # segundos
-
-# Reintentos ante rate limit (429) para cualquier llamada a Gemini.
+MAX_ITEMS_PER_RUN = 3
+MAX_HOURS_OLD = 24
+DELAY_ENTRE_FASES = 15
 GEMINI_MAX_RETRIES = 4
-GEMINI_BASE_BACKOFF = 8  # segundos, crece exponencialmente: 8, 16, 32, 64...
+GEMINI_BASE_BACKOFF = 8
 
-# Headers realistas para no ser bloqueado por medios (The Verge, TechCrunch, etc. filtran bots)
+# Umbral de similitud para considerar que dos noticias cubren el mismo tema.
+# 0.35 = bastante permisivo (temas relacionados), 0.55 = mas estricto (casi identicos).
+SIMILITUD_MINIMA = 0.40
+
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -63,7 +64,6 @@ REQUEST_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Palabras clave para el filtro rapido (barrera de entrada)
 KEYWORDS = [
     "inteligencia artificial", "ai", "ciberseguridad", "seguridad informatica",
     "software", "hardware", "app", "smartphone", "google", "microsoft",
@@ -102,6 +102,10 @@ def slugify(text):
     text = re.sub(r"[^\w\s-]", "", text.lower())
     return re.sub(r"[\s_-]+", "-", text).strip("-")[:60]
 
+def similitud_texto(a, b):
+    """Calcula similitud entre dos strings (0.0 a 1.0) usando SequenceMatcher."""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
 # ----------------------------------------------------------------------
 # FILTRO POR FECHA
 # ----------------------------------------------------------------------
@@ -118,7 +122,7 @@ def is_recent(entry, max_hours=MAX_HOURS_OLD):
     return diff.total_seconds() <= max_hours * 3600
 
 # ----------------------------------------------------------------------
-# SISTEMA DE SCORING POR REGLAS (SOLO PARA PREFILTRAR)
+# SISTEMA DE SCORING POR REGLAS
 # ----------------------------------------------------------------------
 
 LAUNCH_KEYWORDS = [
@@ -155,7 +159,6 @@ PENALTY_KEYWORDS = [
 def compute_relevance_score(entry_text):
     text = entry_text.lower()
     is_launch = any(kw in text for kw in LAUNCH_KEYWORDS)
-
     score = 1
     categorias = []
 
@@ -181,20 +184,113 @@ def compute_relevance_score(entry_text):
     return max(0, min(10, score)), (categorias[0] if categorias else "general")
 
 # ----------------------------------------------------------------------
-# EXTRACCIÓN DEL ARTÍCULO COMPLETO (robusta, con fallback en cascada)
+# TRIANGULACION DE FUENTES
+# ----------------------------------------------------------------------
+
+def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
+    """
+    Busca entre todos los candidatos una segunda nota que cubra el mismo
+    tema que el item principal, de una fuente distinta.
+    Usa similitud de título + resumen como criterio.
+    Devuelve el candidato más similar (si supera el umbral) o None.
+    """
+    texto_principal = item_principal["title"] + " " + item_principal["summary"]
+    mejor_similitud = 0
+    mejor_candidato = None
+
+    for candidato in todos_los_candidatos:
+        # Descartar si es el mismo item o de la misma fuente
+        if candidato["hash"] == item_principal["hash"]:
+            continue
+        if candidato["source"] == item_principal["source"]:
+            continue
+
+        texto_candidato = candidato["title"] + " " + candidato["summary"]
+        sim = similitud_texto(texto_principal, texto_candidato)
+
+        if sim > mejor_similitud:
+            mejor_similitud = sim
+            mejor_candidato = candidato
+
+    if mejor_similitud >= SIMILITUD_MINIMA:
+        print(f"  🔗 Fuente secundaria encontrada ({mejor_similitud:.0%} similitud): "
+              f"{mejor_candidato['source']} — {mejor_candidato['title'][:60]}")
+        return mejor_candidato
+
+    print(f"  ℹ️ No se encontró fuente secundaria con similitud suficiente "
+          f"(máx: {mejor_similitud:.0%}, umbral: {SIMILITUD_MINIMA:.0%})")
+    return None
+
+# ----------------------------------------------------------------------
+# BUSQUEDA DE IMAGEN VIA GOOGLE CUSTOM SEARCH
+# ----------------------------------------------------------------------
+
+def buscar_imagen_google(query, fallback_url=None):
+    """
+    Busca una imagen relacionada con el tema del artículo usando
+    Google Custom Search API (100 búsquedas/día gratis).
+    Devuelve la URL de la primera imagen encontrada, o fallback_url si falla.
+    """
+    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
+        print("⚠️ Sin credenciales de Google Search, usando imagen de la fuente original.")
+        return fallback_url
+
+    # Limitar el query a las primeras palabras más relevantes para mayor precisión
+    query_corto = " ".join(query.split()[:8])
+    print(f"🔍 Buscando imagen para: '{query_corto}'...")
+
+    params = {
+        "key": GOOGLE_SEARCH_API_KEY,
+        "cx": GOOGLE_SEARCH_ENGINE_ID,
+        "q": query_corto,
+        "searchType": "image",
+        "num": 5,                    # traer 5 y elegir la mejor
+        "imgSize": "large",          # imágenes grandes (mejor calidad para Instagram)
+        "imgType": "news",           # tipo noticia, más relevante para tech
+        "safe": "active",
+        "fileType": "jpg",
+    }
+
+    try:
+        resp = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=15)
+        if resp.status_code == 200:
+            items = resp.json().get("items", [])
+            if items:
+                # Elegir la primera que no sea un logo pequeño
+                # (los logos suelen tener width/height muy chicos)
+                for item in items:
+                    image_info = item.get("image", {})
+                    width = image_info.get("width", 0)
+                    height = image_info.get("height", 0)
+                    url = item.get("link", "")
+                    # Descartar imágenes muy pequeñas (probable logo o ícono)
+                    if width >= 400 and height >= 300 and url:
+                        print(f"✅ Imagen encontrada: {url[:80]}")
+                        return url
+                # Si todas son pequeñas, devolver la primera igual
+                primera_url = items[0].get("link", "")
+                if primera_url:
+                    print(f"✅ Imagen encontrada (sin filtro de tamaño): {primera_url[:80]}")
+                    return primera_url
+        else:
+            print(f"⚠️ Error Google Search API: {resp.status_code}")
+    except Exception as e:
+        print(f"⚠️ Excepción buscando imagen: {e}")
+
+    print("⚠️ No se encontró imagen, usando imagen de la fuente original.")
+    return fallback_url
+
+# ----------------------------------------------------------------------
+# EXTRACCION DEL ARTICULO COMPLETO (robusta, con fallback en cascada)
 # ----------------------------------------------------------------------
 
 def _fetch_html(url, timeout=15):
-    """Descarga el HTML crudo con headers realistas y timeout corto."""
     resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout, allow_redirects=True)
     resp.raise_for_status()
-    resp.encoding = resp.apparent_encoding  # evita textos con caracteres rotos (acentos, ñ, etc.)
+    resp.encoding = resp.apparent_encoding
     return resp.text
 
-
 def _extract_with_trafilatura(html, url):
-    """Método principal: funciona bien tanto en medios grandes (The Verge, TechCrunch)
-    como en medios argentinos (Xataka, La Nación, Infobae, etc.)."""
     text = trafilatura.extract(
         html,
         url=url,
@@ -213,9 +309,7 @@ def _extract_with_trafilatura(html, url):
         }
     return None
 
-
 def _extract_with_readability(html, url):
-    """Fallback si trafilatura no consigue suficiente texto (sitios con markup atípico)."""
     try:
         doc = Document(html)
         title = doc.short_title()
@@ -225,36 +319,31 @@ def _extract_with_readability(html, url):
             p.get_text(strip=True) for p in soup.find_all("p") if p.get_text(strip=True)
         )
         if text and len(text) >= 200:
-            return {"title": title, "text": text, "authors": [], "publish_date": None, "top_image": None}
+            return {"title": title, "text": text, "authors": [],
+                    "publish_date": None, "top_image": None}
     except Exception:
         pass
     return None
 
-
 def extract_full_article(url):
-    """
-    Extrae el contenido completo de un artículo desde su URL.
-    Orden de intentos: trafilatura -> readability -> None (usa el resumen del RSS).
-    Sirve tanto para medios internacionales como argentinos, sin reglas por sitio.
-    """
     try:
-        print(f"📄 Extrayendo artículo completo: {url[:60]}...")
+        print(f"  📄 Extrayendo: {url[:60]}...")
         html = _fetch_html(url)
     except requests.exceptions.RequestException as e:
-        print(f"⚠️ No se pudo descargar la URL ({type(e).__name__}): {e}")
+        print(f"  ⚠️ No se pudo descargar ({type(e).__name__}): {e}")
         return None
 
     result = _extract_with_trafilatura(html, url)
     if result:
-        print(f"✅ Extraído con trafilatura ({len(result['text'])} caracteres)")
+        print(f"  ✅ Trafilatura ({len(result['text'])} caracteres)")
         return result
 
     result = _extract_with_readability(html, url)
     if result:
-        print(f"✅ Extraído con readability (fallback) ({len(result['text'])} caracteres)")
+        print(f"  ✅ Readability fallback ({len(result['text'])} caracteres)")
         return result
 
-    print("⚠️ Ningún método pudo extraer texto útil, se usará el resumen del RSS.")
+    print("  ⚠️ No se pudo extraer texto, se usará resumen del RSS.")
     return None
 
 # ----------------------------------------------------------------------
@@ -262,12 +351,6 @@ def extract_full_article(url):
 # ----------------------------------------------------------------------
 
 def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES):
-    """
-    Hace POST a Gemini con reintentos ante 429 (rate limit) y errores
-    transitorios de red (timeout, conexión). 'context' es solo para logs.
-    Devuelve el dict de la respuesta JSON si tiene éxito, o lanza excepción
-    si se agotan los reintentos.
-    """
     if not GEMINI_API_KEY:
         raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY")
 
@@ -279,21 +362,18 @@ def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES):
 
             if resp.status_code == 200:
                 return resp.json()
-
             elif resp.status_code == 429:
                 wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
                 print(f"[RATE LIMIT] {context}: intento {attempt + 1}/{retries}, esperando {wait}s...")
                 time.sleep(wait)
                 last_error = RuntimeError(f"429 rate limit tras {retries} intentos ({context})")
                 continue
-
             elif resp.status_code >= 500:
                 wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
                 print(f"[SERVER ERROR] {context}: {resp.status_code}, esperando {wait}s...")
                 time.sleep(wait)
-                last_error = RuntimeError(f"Error {resp.status_code} tras {retries} intentos ({context})")
+                last_error = RuntimeError(f"Error {resp.status_code} ({context})")
                 continue
-
             else:
                 raise RuntimeError(f"Error Gemini {resp.status_code} ({context}): {resp.text[:300]}")
 
@@ -397,7 +477,6 @@ def fetch_new_relevant_items():
             h = item_hash(entry)
             if h in seen:
                 continue
-
             if not is_recent(entry):
                 continue
             if not is_relevant(entry):
@@ -423,7 +502,10 @@ def fetch_new_relevant_items():
     print(f"📰 Noticias que pasaron el filtro rapido: {len(candidatos)}")
 
     if not candidatos:
-        return []
+        return [], []
+
+    # Guardamos todos los candidatos para la triangulacion posterior
+    todos_los_candidatos = candidatos.copy()
 
     if len(candidatos) > 30:
         candidatos.sort(key=lambda x: x["score_reglas"], reverse=True)
@@ -435,7 +517,6 @@ def fetch_new_relevant_items():
     else:
         seleccionados_por_ia = candidatos
 
-    # Tope por fuente (equidad)
     seleccionados_final = []
     conteo_por_fuente = {}
 
@@ -456,30 +537,61 @@ def fetch_new_relevant_items():
     for it in seleccionados_final:
         print(f"  [{it['score_reglas']:>2}pts | {it['categoria_reglas']:<9}] {it['title'][:70]}")
 
-    return seleccionados_final
+    # Devolvemos también todos_los_candidatos para poder triangular después
+    return seleccionados_final, todos_los_candidatos
 
 # ----------------------------------------------------------------------
-# REDACCION CON ARTICULO COMPLETO
+# CONSTRUCCION DEL PROMPT (con soporte para fuente secundaria)
 # ----------------------------------------------------------------------
 
-def build_prompt(item, full_text):
-    """
-    Construye el prompt para Gemini usando el artículo completo extraído.
-    """
-    # Limitar el texto a 8000 caracteres para no exceder el contexto de Gemini
-    text_limit = full_text[:8000] if full_text else item['summary']
+def build_prompt(item, full_text_principal, fuente_secundaria=None,
+                 full_text_secundario=None, imagen_url=None):
+    text_limit = full_text_principal[:6000] if full_text_principal else item['summary']
+
+    # Si hay fuente secundaria, le pasamos su contenido a Gemini también
+    bloque_secundario = ""
+    if fuente_secundaria and full_text_secundario:
+        text_sec = full_text_secundario[:3000]
+        bloque_secundario = f"""
+FUENTE SECUNDARIA (segundo medio que cubre el mismo tema — usala para enriquecer,
+contrastar datos, o agregar perspectivas que no estén en la fuente principal):
+Título: {fuente_secundaria['title']}
+Medio: {fuente_secundaria['source']}
+URL: {fuente_secundaria['link']}
+
+{text_sec}
+"""
+    elif fuente_secundaria:
+        # Llegó el item pero no se pudo extraer el texto completo
+        bloque_secundario = f"""
+FUENTE SECUNDARIA (resumen del RSS, no se pudo extraer el artículo completo):
+Título: {fuente_secundaria['title']}
+Medio: {fuente_secundaria['source']}
+URL: {fuente_secundaria['link']}
+Resumen: {fuente_secundaria['summary']}
+"""
+
+    instruccion_imagen = ""
+    if imagen_url:
+        instruccion_imagen = f"\nImagen sugerida para el artículo (URL): {imagen_url}"
 
     return f"""Actua como un redactor SEO senior especializado en tecnologia,
 con dominio experto de los criterios de puntuacion de Rank Math para WordPress,
 escribiendo para el sitio argentino tecno.ar.
 
-FUENTE DE REFERENCIA (USA ESTE TEXTO COMPLETO PARA REDACTAR, NO INVENTES DATOS):
+FUENTE PRINCIPAL (basate principalmente en este texto para redactar):
 Titulo original: {item['title']}
 Medio: {item['source']}
 URL original: {item['link']}
+{instruccion_imagen}
 
-TEXTO COMPLETO DEL ARTICULO (basate en esto para redactar, sin inventar):
+TEXTO COMPLETO DEL ARTICULO PRINCIPAL:
 {text_limit}
+{bloque_secundario}
+===========================================
+INSTRUCCIONES DE REDACCION CON FUENTES MULTIPLES
+===========================================
+{"Tenés DOS fuentes sobre el mismo tema. Usá ambas para: (1) cruzar datos y mencionar si coinciden o difieren, (2) agregar perspectivas o detalles que solo tenga una de las dos, (3) citar a los dos medios en el texto cuando corresponda. NO copies frases textuales de ninguna fuente." if bloque_secundario else "Redactá basándote en la fuente principal, parafraseando completamente y agregando contexto."}
 
 ===========================================
 PASO 1: DEFINI EL FOCUS KEYWORD (REGLAS SEMANTICAS ESTRICTAS)
@@ -499,26 +611,17 @@ EJEMPLOS DE KEYWORDS INCORRECTOS (rechazar siempre este patron):
 EJEMPLOS DE KEYWORDS CORRECTOS PARA ESOS MISMOS CASOS:
 - "modo de voz de ChatGPT"        (en vez de "GPT-Live OpenAI")
 - "chips de Apple con Broadcom"   (en vez de "Apple Broadcom Chips")
-- "rastreador Moto Tag 2"         (en vez de "Moto Tag 2 Motorola";
-   aca "rastreador" es la categoria del producto, que SI se puede combinar
-   naturalmente con el nombre propio)
+- "rastreador Moto Tag 2"         (en vez de "Moto Tag 2 Motorola")
 
 REGLA GENERAL: si el nombre del producto ya es un sustantivo reconocible en
 español (rastreador, auriculares, procesador, modelo, chatbot, app, robot,
 notebook, etc.), combina ESA categoria con el nombre propio del producto.
-Si el nombre propio no tiene una categoria clara en el texto, arma una frase
-descriptiva de lo que HACE o ES la noticia (ej: "voz mas natural de ChatGPT",
-en vez de encadenar los dos nombres propios de la marca y el producto).
 
-CHECKLIST antes de definir el keyword final (verificalo vos mismo):
+CHECKLIST antes de definir el keyword final:
 1. ¿Se puede leer el keyword dentro de una oracion completa sin sonar
-   una lista de nombres propios pegados? Si no, reformulalo.
-2. ¿Tiene al menos una palabra funcional en español (de, con, para, en) que
-   conecte los sustantivos, salvo que sea una sola categoria + un nombre
-   propio (ej: "rastreador Moto Tag 2")? Si son 2+ nombres propios de marcas
-   o modelos distintos pegados sin conector, esta mal.
-3. ¿Es asi como lo diria un periodista argentino en voz alta? Si suena a
-   tag de metadata, esta mal.
+   una lista de nombres propios pegados?
+2. ¿Tiene al menos una palabra funcional en español (de, con, para, en)?
+3. ¿Es asi como lo diria un periodista argentino en voz alta?
 
 ===========================================
 PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
@@ -546,7 +649,7 @@ El titulo visible del articulo. Debe incluir el focus keyword.
 El cuerpo de la nota en Markdown (600-900 palabras), siguiendo ESTAS reglas:
 1. ESTRUCTURA:
    - El focus keyword debe aparecer en el PRIMER PARRAFO, integrado en una
-     oracion natural (nunca pegado como si fuera una etiqueta suelta).
+     oracion natural.
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
    - Parrafos cortos: maximo 3-4 lineas cada uno.
 2. CONTENIDO:
@@ -555,11 +658,11 @@ El cuerpo de la nota en Markdown (600-900 palabras), siguiendo ESTAS reglas:
    - Evita frases genericas de relleno tipicas de IA.
    - Voz activa, tono profesional pero cercano (espanol rioplatense).
    - COHERENCIA: relee mentalmente cada oracion donde aparece el focus
-     keyword y confirma que se entiende igual que el resto del texto,
-     sin cortes abruptos de sintaxis.
+     keyword y confirma que se entiende igual que el resto del texto.
 3. ENLACES:
    - Incluir al menos 1 ENLACE EXTERNO real hacia la fuente original:
      [texto del enlace]({item['link']})
+   {"- Incluir también 1 ENLACE a la fuente secundaria: [texto](" + fuente_secundaria['link'] + ")" if fuente_secundaria else ""}
 4. IMAGEN:
    - Al final, sugeri un ALT_TEXT para la imagen destacada, de 8-12 palabras.
 
@@ -569,21 +672,16 @@ FORMATO DE SALIDA
 Devolveme EXCLUSIVAMENTE los campos de arriba (FOCUS_KEYWORD, SEO_TITLE, SLUG,
 META_DESCRIPTION, H1, ARTICULO, ALT_TEXT) con esos encabezados exactos en
 Markdown. No agregues explicaciones fuera de esa estructura.
-Al final del ARTICULO, agrega: "Fuente: {item['source']}"
+Al final del ARTICULO, agrega: "Fuente: {item['source']}{f' y {fuente_secundaria["source"]}' if fuente_secundaria else ''}"
 """
 
+# ----------------------------------------------------------------------
+# REDACCION CON GEMINI
+# ----------------------------------------------------------------------
 
 def call_gemini(prompt):
-    """
-    Redacta el artículo con Gemini, usando el helper compartido con
-    retry/backoff ante 429 y errores transitorios.
-    """
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
-
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     data = call_gemini_api(payload, context="redaccion")
-
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError):
@@ -594,8 +692,10 @@ def call_gemini(prompt):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 2.0 con artículos completos...")
-    items = fetch_new_relevant_items()
+    print("🚀 Iniciando pipeline Hybrid 2.0 con triangulacion de fuentes e imagen IA...")
+
+    # fetch_new_relevant_items ahora devuelve dos listas
+    items, todos_los_candidatos = fetch_new_relevant_items()
     print(f"Encontrados {len(items)} items nuevos para procesar.")
 
     try:
@@ -606,23 +706,50 @@ def main():
         print("⚠️ No se encontró 'publish_to_wordpress'. Los borradores se guardarán LOCALMENTE.")
         tiene_wp = False
 
+    if items:
+        print(f"⏳ Esperando {DELAY_ENTRE_FASES}s antes de redactar (evitar rate limit)...")
+        time.sleep(DELAY_ENTRE_FASES)
+
     for item in items:
-        print(f"\n📄 Procesando: {item['title'][:70]}...")
+        print(f"\n{'='*60}")
+        print(f"📄 Procesando: {item['title'][:70]}...")
 
-        # 1. Extraer el artículo completo
+        # 1. Triangulacion: buscar fuente secundaria
+        print("🔗 Buscando fuente secundaria...")
+        fuente_secundaria = encontrar_fuente_secundaria(item, todos_los_candidatos)
+
+        # 2. Extraer articulo principal
+        print("📥 Extrayendo fuente principal...")
         full_article = extract_full_article(item['link'])
+        contenido_principal = (
+            full_article['text'] if full_article and full_article.get('text')
+            else item['summary']
+        )
 
-        # 2. Si no se pudo extraer, usar el resumen como fallback
-        if full_article and full_article.get('text'):
-            contenido_para_redactar = full_article['text']
-            print(f"✅ Artículo completo extraído ({len(contenido_para_redactar)} caracteres)")
-        else:
-            contenido_para_redactar = item['summary']
-            print(f"⚠️ Usando resumen del RSS ({len(contenido_para_redactar)} caracteres)")
+        # 3. Extraer fuente secundaria (si existe)
+        contenido_secundario = None
+        if fuente_secundaria:
+            print("📥 Extrayendo fuente secundaria...")
+            full_article_sec = extract_full_article(fuente_secundaria['link'])
+            contenido_secundario = (
+                full_article_sec['text'] if full_article_sec and full_article_sec.get('text')
+                else None
+            )
 
-        # 3. Redactar con Gemini
+        # 4. Buscar imagen relevante con Google Custom Search
+        print("🖼️ Buscando imagen relevante...")
+        fallback_image = full_article.get('top_image') if full_article else None
+        imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
+
+        # 5. Redactar con Gemini (con todo el contexto triangulado)
         try:
-            prompt = build_prompt(item, contenido_para_redactar)
+            prompt = build_prompt(
+                item,
+                contenido_principal,
+                fuente_secundaria=fuente_secundaria,
+                full_text_secundario=contenido_secundario,
+                imagen_url=imagen_url,
+            )
             article = call_gemini(prompt)
 
             if tiene_wp:
@@ -637,7 +764,8 @@ def main():
 
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
-        time.sleep(6)  # Pausa entre items para respetar límites
+
+        time.sleep(6)
 
     print("\n✅ Pipeline finalizado.")
 
