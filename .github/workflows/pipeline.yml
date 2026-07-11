@@ -1,7 +1,5 @@
 name: Pipeline de contenido tecno.ar
-
 permissions: write-all
-
 on:
   workflow_dispatch: {}
 
@@ -23,6 +21,8 @@ jobs:
       - name: Ejecutar pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_SEARCH_API_KEY: ${{ secrets.GOOGLE_SEARCH_API_KEY }}
+          GOOGLE_SEARCH_ENGINE_ID: ${{ secrets.GOOGLE_SEARCH_ENGINE_ID }}
         run: python pipeline.py
 
       - name: Subir borradores a WordPress
