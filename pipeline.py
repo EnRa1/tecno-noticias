@@ -699,21 +699,38 @@ tiene un producto con nombre propio + marca (ej: "GPT-Live" de "OpenAI",
 propios uno al lado del otro sin conector, porque eso no es una frase real
 y despues no se puede insertar en el texto sin que quede forzado.
 
-REGLA CRITICA - EL KEYWORD NO PUEDE CONTENER YA EL SUJETO DE LA ORACION:
+REGLA CRITICA #1 - EL KEYWORD NO PUEDE CONTENER YA EL SUJETO DE LA ORACION:
 Si el keyword incluye como sujeto la misma entidad que vas a usar de sujeto
 en la oracion, vas a generar una redundancia (sujeto repetido). Por ejemplo,
 si el keyword es "demanda de Apple a OpenAI por secretos comerciales" y
 armas la oracion "Apple ha iniciado una demanda de Apple a OpenAI...", eso
 es un ERROR GRAVE: el sujeto "Apple" aparece dos veces.
-Para evitarlo, el keyword debe estar formulado como un SUSTANTIVO/EVENTO
-autonomo que se pueda insertar como OBJETO o COMPLEMENTO de la oracion,
-no como una mini-oracion con sujeto propio. Ejemplos:
-- MAL como keyword: "Apple demanda a OpenAI por secretos comerciales"
-  (ya tiene sujeto + verbo, no se puede insertar sin generar redundancia)
-- BIEN como keyword: "demanda por secretos comerciales entre Apple y OpenAI"
-  (es un sustantivo/evento, se puede insertar como objeto de cualquier verbo)
 
-EJEMPLOS DE KEYWORDS INCORRECTOS (rechazar siempre este patron):
+REGLA CRITICA #2 - EL KEYWORD NO PUEDE CONTENER YA LA PALABRA QUE VAS A
+USAR COMO SUSTANTIVO PRINCIPAL DE UN TITULO O FRASE ENVOLVENTE:
+Muchos keywords empiezan con un sustantivo generico (herramienta, funcion,
+modelo, chip, app, actualizacion, servicio). Si armas un titulo o una
+oracion que envuelve al keyword con una plantilla generica que repite ese
+MISMO sustantivo generico, se genera una redundancia de palabra (no solo
+de sujeto). Por ejemplo, con el keyword "herramienta T3MP3ST para pruebas
+de penetracion con Claude Code":
+- MAL: "T3MP3ST: la herramienta que facilita la herramienta T3MP3ST para..."
+  (la palabra "herramienta" aparece dos veces, una en la plantilla del titulo
+  y otra ya incluida dentro del keyword)
+- BIEN: "T3MP3ST: la herramienta T3MP3ST para pruebas de penetracion con
+  Claude Code" (el keyword se inserta una sola vez, sin envolverlo en una
+  frase que repita su propio sustantivo)
+- TAMBIEN BIEN: "Asi funciona T3MP3ST, la herramienta T3MP3ST para pruebas
+  de penetracion con Claude Code" (la frase envolvente usa un verbo/adverbio
+  distinto, no repite "herramienta" antes del keyword)
+
+REGLA GENERAL DE ORO: antes de escribir cualquier titulo, H1, o primera
+oracion del cuerpo, identifica la PRIMERA PALABRA SUSTANTIVA del keyword
+(ej: "herramienta", "demanda", "modelo", "chip"). Esa palabra NO puede
+volver a aparecer en la frase envolvente que rodea al keyword, salvo que el
+keyword se inserte una unica vez sin ningun envoltorio adicional.
+
+EJEMPLOS DE KEYWORDS INCORRECTOS COMO FRASE (rechazar siempre este patron):
 - "GPT-Live OpenAI"        -> mal: dos nombres propios pegados, no es una frase
 - "Apple Broadcom Chips"   -> mal: tres sustantivos en ingles sin conector
 - "Moto Tag 2 Motorola"    -> mal: producto + marca sin relacion gramatical
@@ -724,6 +741,8 @@ EJEMPLOS DE KEYWORDS CORRECTOS:
 - "chips de Apple con Broadcom"                     (sustantivo + complementos)
 - "rastreador Moto Tag 2"                           (sustantivo + nombre propio)
 - "demanda por secretos comerciales entre Apple y OpenAI"  (evento como sustantivo)
+- "herramienta T3MP3ST para pruebas de penetracion con Claude Code" (correcto
+  como keyword, PERO requiere cuidado especial al insertarlo, ver Regla Critica #2)
 
 CHECKLIST antes de definir el keyword final (las 4 deben dar SI):
 1. ¿Se puede leer el keyword dentro de una oracion completa sin sonar
@@ -739,14 +758,20 @@ PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
 
 ## FOCUS_KEYWORD
 [el keyword elegido, validado con el checklist de arriba. ESTE STRING EXACTO,
-caracter por caracter, es el que vas a repetir en SEO_TITLE, H1, en el primer
-parrafo del ARTICULO y en los demás si es necesario. No lo conjugues, no le cambies el orden de las palabras,
+caracter por caracter, es el que vas a repetir en SEO_TITLE, H1, y en el primer
+parrafo del ARTICULO. No lo conjugues, no le cambies el orden de las palabras,
 no le agregues ni saques articulos. Es un string fijo que se copia y pega igual
 en cada instancia obligatoria.]
 
 ## SEO_TITLE
 Titulo de 50-60 caracteres. El focus keyword (string identico al de arriba)
 debe aparecer lo mas cerca posible del inicio del titulo.
+ANTES DE ESCRIBIRLO: aplica la Regla Critica #2. Identifica la primera palabra
+sustantiva del keyword y asegurate de que la plantilla del titulo NO la repita
+antes de insertar el keyword. Si el keyword ya es autosuficiente como titulo
+(ej: "herramienta T3MP3ST para pruebas de penetracion con Claude Code"), NO le
+agregues una frase envolvente generica delante — insertalo directo o
+antecedido por algo especifico de la noticia (un dato, una accion, un "asi").
 
 ## SLUG
 version-corta-en-minusculas-con-guiones-del-focus-keyword
@@ -759,15 +784,21 @@ NO usar asteriscos ni markdown de ningun tipo dentro de este campo.
 
 ## H1
 El titulo visible del articulo. Debe incluir el focus keyword (string identico).
+Aplica la MISMA Regla Critica #2 que en el SEO_TITLE: no repitas la primera
+palabra sustantiva del keyword en la frase que lo envuelve.
 
 ## ARTICULO
 El cuerpo de la nota en Markdown (600-900 palabras):
 
 1. PRIMERA MENCION DEL KEYWORD (la mas importante):
-   - Antes de escribir la oracion, preguntate: "¿el keyword ya trae su propio
-     sujeto y verbo?" Si es asi, NO uses ese mismo sujeto como sujeto de tu
-     oracion — usa un sujeto distinto, o reformula para que el keyword entre
-     como complemento/objeto.
+   - Antes de escribir la oracion, preguntate DOS cosas:
+     a) "¿el keyword ya trae su propio sujeto y verbo?" (Regla Critica #1)
+     b) "¿el keyword ya trae su propio sustantivo principal que mi frase
+        envolvente podria repetir?" (Regla Critica #2)
+   - Si (a) es cierto, usa un sujeto distinto para tu oracion, o reformula
+     para que el keyword entre como complemento/objeto.
+   - Si (b) es cierto, no repitas esa palabra sustantiva en el texto que
+     rodea directamente al keyword.
    - Ejemplo de integracion CORRECTA con keyword "demanda por secretos
      comerciales entre Apple y OpenAI":
      "La tensión entre gigantes tecnológicos escaló esta semana con una
@@ -775,39 +806,70 @@ El cuerpo de la nota en Markdown (600-900 palabras):
      ante un tribunal de California."
    - Ejemplo de integracion INCORRECTA (sujeto duplicado):
      "Apple ha iniciado una demanda de Apple a OpenAI por secretos..."
+   - Ejemplo de integracion INCORRECTA (sustantivo duplicado):
+     "Existe una nueva herramienta que facilita la [herramienta T3MP3ST
+     para pruebas de penetracion con Claude Code]"
    - El keyword debe aparecer como STRING EXACTO (mismas palabras, mismo
      orden) dentro de una oracion que se lea 100% natural al leerla en voz alta.
    - Releé la oracion completa antes de continuar: si suena repetitiva,
      redundante, o forzada, reescribila desde cero cambiando el sujeto o
      la estructura de la oracion, NUNCA cambiando el keyword.
 
-2. ESTRUCTURA:
+2. SUBTITULOS (H2) — EL KEYWORD DEBE ESTAR PRESENTE:
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
+   - AL MENOS UNO de esos subtitulos (idealmente el primero o el segundo)
+     debe contener el focus keyword completo, o una VARIACION cercana del
+     mismo (ej: cambiando el orden de las palabras, usando plural/singular,
+     o reemplazando una preposicion por otra equivalente), siempre y cuando
+     el subtitulo se siga leyendo natural, como un titulo real de seccion.
+   - Ejemplo con keyword "herramienta T3MP3ST para pruebas de penetracion
+     con Claude Code":
+     -> H2 correcto: "## Como funciona la herramienta T3MP3ST para pruebas
+        de penetracion"
+     -> H2 correcto (variacion): "## T3MP3ST y las pruebas de penetracion
+        con Claude Code"
+     -> H2 incorrecto: "## Caracteristicas principales" (generico, no
+        menciona el keyword ni ninguna variacion suya)
+   - Los demas H2 (los que no llevan el keyword) pueden ser mas libres y
+     tematicos (ej: antecedentes, riesgos, contexto de la industria), pero
+     igual deben estar relacionados directamente con el tema del articulo.
+   - NUNCA repitas el keyword completo en mas de un H2 (para no sonar
+     repetitivo); si necesitas reforzarlo en otro subtitulo, usa una
+     variacion distinta a la ya usada, no el mismo string dos veces.
+
+3. ESTRUCTURA GENERAL:
    - Parrafos cortos: maximo 3-4 lineas cada uno.
 
-3. CONTENIDO:
+4. CONTENIDO:
    - NO copies frases textuales de la fuente; parafrasea completamente.
    - Evita frases genericas de relleno tipicas de IA.
    - Voz activa, tono profesional pero cercano (español).
    - No menciones en el cuerpo del articulo el nombre de otros medios/fuentes.
 
-4. ENLACES:
+5. ENLACES:
    - El PRIMER enlace externo va exactamente sobre la mención del focus
-     keyword los últimos párrafos (el mismo lugar del punto 1), asi:
+     keyword en el primer párrafo (el mismo lugar del punto 1), asi:
      [{{el string exacto del keyword}}]({item['link']})
-   {"- Incluí un segundo enlace hacia la fuente secundaria, en otro punto del texto donde tenga sentido y relación a lo que se está hablando, asi: [texto natural](" + fuente_secundaria['link'] + ")" if fuente_secundaria else ""}
+   {"- Incluí un segundo enlace hacia la fuente secundaria, en otro punto del texto donde tenga sentido, asi: [texto natural](" + fuente_secundaria['link'] + ")" if fuente_secundaria else ""}
 
 ===========================================
 VALIDACION FINAL OBLIGATORIA (haceła antes de responder)
 ===========================================
-Antes de entregar la respuesta, verificá vos mismo:
+Antes de entregar la respuesta, verificá vos mismo, CAMPO POR CAMPO:
 1. ¿El FOCUS_KEYWORD es idéntico, carácter por carácter, en SEO_TITLE, H1,
    y en la primera mención dentro del ARTICULO? Si hay una sola diferencia
    (singular/plural, orden de palabras, articulo agregado/sacado), corregilo.
-2. ¿La oración donde aparece el keyword por primera vez repite el mismo
-   sujeto dos veces? Si es así, reescribí la oración completa.
-3. ¿La oración suena como la diría un periodista al leerla en voz alta,
-   sin sonar forzada o robótica?
+2. En el SEO_TITLE: ¿la primera palabra sustantiva del keyword se repite en
+   la frase que lo envuelve? Si es así, reescribí el título completo.
+3. En el H1: mismo chequeo que el punto 2.
+4. En el ARTICULO: ¿la oración donde aparece el keyword por primera vez
+   repite el mismo sujeto o el mismo sustantivo principal dos veces? Si es
+   así, reescribí la oración completa.
+5. ¿Al menos uno de los subtitulos H2 contiene el keyword completo o una
+   variacion cercana del mismo? Contá los H2 uno por uno y confirmá que no
+   sean todos genéricos sin relación textual con el keyword.
+6. ¿Cada una de estas oraciones/títulos suena como la diría un periodista
+   al leerla en voz alta, sin sonar forzada, robótica, o redundante?
 
 ===========================================
 FORMATO DE SALIDA
