@@ -1051,57 +1051,57 @@ def main():
         time.sleep(DELAY_ENTRE_FASES)
 
     for item in items:
-    print(f"\n{'='*60}")
-    print(f"📄 Procesando: {item['title'][:70]}...")
+        print(f"\n{'='*60}")
+        print(f"📄 Procesando: {item['title'][:70]}...")
 
     # 1. Triangulacion, paso 1: busqueda activa en la web (prioridad)
-    print("🌐 Buscando fuentes relacionadas en la web...")
-    fuentes_adicionales = buscar_fuentes_relacionadas(item)
+        print("🌐 Buscando fuentes relacionadas en la web...")
+        fuentes_adicionales = buscar_fuentes_relacionadas(item)
 
-    if not fuentes_adicionales:
+        if not fuentes_adicionales:
         # 2. Si la web no devolvio nada util, caer al pool de RSS como respaldo
-        print("🔗 Sin resultados en la web, probando en el pool de RSS...")
-        fuente_rss = encontrar_fuente_secundaria(item, todos_los_candidatos)
-        if fuente_rss:
-            fuentes_adicionales = [fuente_rss]
+            print("🔗 Sin resultados en la web, probando en el pool de RSS...")
+            fuente_rss = encontrar_fuente_secundaria(item, todos_los_candidatos)
+            if fuente_rss:
+                fuentes_adicionales = [fuente_rss]
 
     # 3. Extraer el texto completo de cada fuente adicional encontrada
-    for f in fuentes_adicionales:
-        print(f"📥 Extrayendo fuente adicional: {f['source']}...")
-        full_sec = extract_full_article(f["link"])
-        f["texto_completo"] = (
-            full_sec["text"] if full_sec and full_sec.get("text")
-            else f.get("summary", "")
-        )
+        for f in fuentes_adicionales:
+            print(f"📥 Extrayendo fuente adicional: {f['source']}...")
+            full_sec = extract_full_article(f["link"])
+            f["texto_completo"] = (
+                full_sec["text"] if full_sec and full_sec.get("text")
+                else f.get("summary", "")
+            )
 
     # 4. Extraer articulo principal
-    print("📥 Extrayendo fuente principal...")
-    full_article = extract_full_article(item['link'])
-    contenido_principal = (
-        full_article['text'] if full_article and full_article.get('text')
-        else item['summary']
-    )
+        print("📥 Extrayendo fuente principal...")
+        full_article = extract_full_article(item['link'])
+        contenido_principal = (
+            full_article['text'] if full_article and full_article.get('text')
+            else item['summary']
+        )
 
     # 5. Buscar imagen relevante con Google Custom Search
-    print("🖼️ Buscando imagen relevante...")
-    fallback_image = full_article.get('top_image') if full_article else None
-    imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
+        print("🖼️ Buscando imagen relevante...")
+        fallback_image = full_article.get('top_image') if full_article else None
+        imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
 
     # 6. Redactar con Gemini (con todo el contexto triangulado)
-    try:
-        prompt = build_prompt(
-            item,
-            contenido_principal,
-            fuentes_adicionales=fuentes_adicionales,
-            imagen_url=imagen_url,
-        )
-        article = call_gemini(prompt)
-        save_draft(item, article, imagen_url=imagen_url)
+        try:
+            prompt = build_prompt(
+                item,
+                contenido_principal,
+                fuentes_adicionales=fuentes_adicionales,
+                imagen_url=imagen_url,
+            )
+            article = call_gemini(prompt)
+            save_draft(item, article, imagen_url=imagen_url)
 
-    except Exception as e:
-        print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
+        except Exception as e:
+            print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
 
-    time.sleep(6)
+        time.sleep(6)
 
     print("\n✅ Pipeline finalizado.")
 
