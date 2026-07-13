@@ -7,7 +7,6 @@ https://www.clarin.com/rss/tecnologia/
 https://blog.google/rss/
 https://news.microsoft.com/source/feed/
 https://aws.amazon.com/blogs/aws/feed/
-https://www.xataka.com/feedburner.xml
 https://www.genbeta.com/feedburner.xml
 https://hipertextual.com/feed
 https://openai.com/news/rss.xml
