@@ -4,7 +4,8 @@ Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo)
 ==========================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las mejores
-3. Triangulacion de fuentes: pool de RSS primero, busqueda activa en la web despues
+3. Triangulacion de fuentes: busqueda activa en sitios de referencia primero,
+   pool de RSS como respaldo
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
 5. Busqueda de imagen relevante via Google Custom Search API
 6. Redaccion con Gemini usando contenido triangulado (con retry, keyword semantico)
@@ -34,7 +35,7 @@ SEEN_FILE = BASE_DIR / "seen.json"
 DRAFTS_DIR = BASE_DIR / "drafts"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -55,6 +56,25 @@ MAX_FUENTES_ADICIONALES = 2
 # Umbral de similitud para considerar que dos noticias del pool de RSS
 # cubren el mismo tema. Se calcula con Jaccard sobre palabras clave.
 SIMILITUD_MINIMA = 0.18
+
+# Sitios especificos donde buscar fuentes relacionadas (se arma como OR de
+# operadores site: dentro de la query de Google Custom Search). Editá esta
+# lista libremente para sumar o sacar medios de referencia.
+SITIOS_REFERENCIA_BUSQUEDA = [
+    "techcrunch.com",
+    "theverge.com",
+    "wired.com",
+    "engadget.com",
+    "genbeta.com",
+    "hipertextual.com",
+    "infobae.com",
+    "blog.google",
+    "news.microsoft.com",
+    "openai.com",
+    "thehackernews.com",
+    "bleepingcomputer.com",
+    "reuters.com"
+]
 
 # Dominios que no cuentan como "fuente distinta" util al triangular via web
 # (agregadores, redes sociales; el dominio de origen se excluye dinamicamente).
@@ -219,15 +239,19 @@ def compute_relevance_score(entry_text):
     return max(0, min(10, score)), (categorias[0] if categorias else "general")
 
 # ----------------------------------------------------------------------
-# TRIANGULACION DE FUENTES - PASO 1: DENTRO DEL POOL DE RSS (gratis)
+# TRIANGULACION DE FUENTES - RESPALDO: DENTRO DEL POOL DE RSS (gratis)
 # ----------------------------------------------------------------------
 
 def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
     """
     Busca entre los candidatos de RSS ya descargados una segunda nota que
     cubra el mismo tema que el item principal, de una fuente distinta.
-    Usa similitud Jaccard de palabras clave (titulo + resumen) como criterio.
-    Devuelve el candidato más similar (si supera el umbral) o None.
+
+    Como se comparan las notas: se convierte el titulo+resumen de cada una en
+    un conjunto de palabras clave (sacando stopwords), y se calcula el indice
+    de Jaccard (interseccion / union) entre ambos conjuntos. Si el resultado
+    supera SIMILITUD_MINIMA, se consideran del mismo tema. Es un calculo
+    matematico local, no llama a ninguna API externa.
     """
     texto_principal = item_principal["title"] + " " + item_principal["summary"]
     mejor_similitud = 0
@@ -256,27 +280,42 @@ def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
     return None
 
 # ----------------------------------------------------------------------
-# TRIANGULACION DE FUENTES - PASO 2: BUSQUEDA ACTIVA EN LA WEB (fallback)
+# TRIANGULACION DE FUENTES - PRIORIDAD: BUSQUEDA EN SITIOS DE REFERENCIA
 # ----------------------------------------------------------------------
 
 def buscar_fuentes_relacionadas(item, max_fuentes=MAX_FUENTES_ADICIONALES):
     """
-    Busca en toda la web (via Google Custom Search, modo texto) noticias que
-    cubran el mismo tema que el item principal, en dominios distintos al
-    de origen. Devuelve una lista de hasta max_fuentes dicts compatibles
-    con el formato de 'candidato' que usa build_prompt.
+    Busca noticias que cubran el mismo tema que el item principal, mediante
+    Google Custom Search, restringido unicamente a los dominios listados en
+    SITIOS_REFERENCIA_BUSQUEDA (usando el operador site: dentro de la query).
 
-    Requiere que el motor de Programmable Search Engine tenga activado
-    "Search the entire web" en su configuracion (si no, solo va a buscar
-    dentro de los sitios especificos que tenga cargados, si tiene alguno).
+    Como determina la relacion tematica: no hay calculo de similitud propio
+    aca. El titulo del item se manda como query de texto a Google, y es el
+    propio motor de busqueda quien decide que resultados son relevantes para
+    esa query (algoritmo interno de Google, no controlado por este codigo).
+    Este codigo solo filtra los resultados por dominio permitido/excluido y
+    arma la lista final.
+
+    Nota sobre la ventana de tiempo: dateRestrict="d1" es la granularidad
+    minima oficial que soporta la API (1 dia). No existe un valor equivalente
+    a "12 horas" en este parametro.
     """
     if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
         print("  ⚠️ Sin credenciales de Google Search, no se puede buscar en la web.")
         return []
 
-    query = " ".join(item["title"].split()[:10])
+    if not SITIOS_REFERENCIA_BUSQUEDA:
+        print("  ⚠️ SITIOS_REFERENCIA_BUSQUEDA esta vacia, no hay donde buscar.")
+        return []
+
+    query_base = " ".join(item["title"].split()[:10])
     dominio_origen = _extraer_dominio(item["link"])
-    print(f"  🌐 Buscando fuentes relacionadas en la web para: '{query[:60]}...'")
+
+    # Arma: (site:techcrunch.com OR site:theverge.com OR ...) titulo de la noticia
+    filtro_sitios = " OR ".join(f"site:{s}" for s in SITIOS_REFERENCIA_BUSQUEDA)
+    query = f"({filtro_sitios}) {query_base}"
+
+    print(f"  🌐 Buscando en sitios de referencia para: '{query_base[:60]}...'")
 
     params = {
         "key": GOOGLE_SEARCH_API_KEY,
@@ -284,7 +323,8 @@ def buscar_fuentes_relacionadas(item, max_fuentes=MAX_FUENTES_ADICIONALES):
         "q": query,
         "num": 10,
         "safe": "active",
-        "dateRestrict": "d1",  # solo resultados de los ultimos 3 dias
+        "dateRestrict": "d1",  # ultimas 24 horas (minimo oficial soportado)
+        "sort": "date",        # prioriza resultados mas recientes primero
     }
 
     try:
@@ -295,7 +335,7 @@ def buscar_fuentes_relacionadas(item, max_fuentes=MAX_FUENTES_ADICIONALES):
 
         items_resultado = resp.json().get("items", [])
         if not items_resultado:
-            print("  ℹ️ No se encontraron resultados relacionados en la web.")
+            print("  ℹ️ No se encontraron resultados en los sitios de referencia.")
             return []
 
         fuentes = []
@@ -326,7 +366,7 @@ def buscar_fuentes_relacionadas(item, max_fuentes=MAX_FUENTES_ADICIONALES):
             print(f"  ✅ {len(fuentes)} fuente(s) relacionada(s) encontrada(s): "
                   + ", ".join(f["source"] for f in fuentes))
         else:
-            print("  ℹ️ Resultados encontrados, pero todos del mismo dominio o excluidos.")
+            print("  ℹ️ Resultados encontrados, pero todos descartados por dominio.")
 
         return fuentes
 
@@ -1054,18 +1094,18 @@ def main():
         print(f"\n{'='*60}")
         print(f"📄 Procesando: {item['title'][:70]}...")
 
-    # 1. Triangulacion, paso 1: busqueda activa en la web (prioridad)
-        print("🌐 Buscando fuentes relacionadas en la web...")
+        # 1. Triangulacion, prioridad: busqueda activa en sitios de referencia
+        print("🌐 Buscando fuentes relacionadas en sitios de referencia...")
         fuentes_adicionales = buscar_fuentes_relacionadas(item)
 
         if not fuentes_adicionales:
-        # 2. Si la web no devolvio nada util, caer al pool de RSS como respaldo
+            # 2. Respaldo: si la busqueda web no encontro nada, probar en el pool de RSS
             print("🔗 Sin resultados en la web, probando en el pool de RSS...")
             fuente_rss = encontrar_fuente_secundaria(item, todos_los_candidatos)
             if fuente_rss:
                 fuentes_adicionales = [fuente_rss]
 
-    # 3. Extraer el texto completo de cada fuente adicional encontrada
+        # 3. Extraer el texto completo de cada fuente adicional encontrada
         for f in fuentes_adicionales:
             print(f"📥 Extrayendo fuente adicional: {f['source']}...")
             full_sec = extract_full_article(f["link"])
@@ -1074,7 +1114,7 @@ def main():
                 else f.get("summary", "")
             )
 
-    # 4. Extraer articulo principal
+        # 4. Extraer articulo principal
         print("📥 Extrayendo fuente principal...")
         full_article = extract_full_article(item['link'])
         contenido_principal = (
@@ -1082,12 +1122,12 @@ def main():
             else item['summary']
         )
 
-    # 5. Buscar imagen relevante con Google Custom Search
+        # 5. Buscar imagen relevante con Google Custom Search
         print("🖼️ Buscando imagen relevante...")
         fallback_image = full_article.get('top_image') if full_article else None
         imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
 
-    # 6. Redactar con Gemini (con todo el contexto triangulado)
+        # 6. Redactar con Gemini (con todo el contexto triangulado)
         try:
             prompt = build_prompt(
                 item,
