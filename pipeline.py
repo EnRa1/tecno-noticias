@@ -3,9 +3,9 @@
 Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo)
 ==========================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
-2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las 3 mejores
-3. Triangulacion de fuentes: busca una segunda nota sobre el mismo tema
-4. Extraccion del articulo completo desde ambas fuentes (trafilatura + readability)
+2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las mejores
+3. Triangulacion de fuentes: pool de RSS primero, busqueda activa en la web despues
+4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
 5. Busqueda de imagen relevante via Google Custom Search API
 6. Redaccion con Gemini usando contenido triangulado (con retry, keyword semantico)
 """
@@ -50,11 +50,18 @@ DELAY_ENTRE_FASES = 15
 GEMINI_MAX_RETRIES = 4
 GEMINI_BASE_BACKOFF = 8
 
-# Umbral de similitud para considerar que dos noticias cubren el mismo tema.
-# Ahora se calcula con Jaccard sobre palabras clave (no diff de caracteres),
-# asi que los valores tipicos son mas bajos que antes.
-# 0.15 = permisivo (temas relacionados), 0.30 = mas estricto (casi identicos).
+MAX_FUENTES_ADICIONALES = 2
+
+# Umbral de similitud para considerar que dos noticias del pool de RSS
+# cubren el mismo tema. Se calcula con Jaccard sobre palabras clave.
 SIMILITUD_MINIMA = 0.18
+
+# Dominios que no cuentan como "fuente distinta" util al triangular via web
+# (agregadores, redes sociales; el dominio de origen se excluye dinamicamente).
+DOMINIOS_EXCLUIDOS = {
+    "twitter.com", "x.com", "facebook.com", "reddit.com",
+    "youtube.com", "tecno.ar",
+}
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -129,6 +136,10 @@ def similitud_texto(a, b):
     interseccion = len(set_a & set_b)
     union = len(set_a | set_b)
     return interseccion / union if union else 0.0
+
+def _extraer_dominio(url):
+    match = re.search(r"https?://(?:www\.)?([^/]+)", url)
+    return match.group(1).lower() if match else ""
 
 # ----------------------------------------------------------------------
 # FILTRO POR FECHA
@@ -208,13 +219,13 @@ def compute_relevance_score(entry_text):
     return max(0, min(10, score)), (categorias[0] if categorias else "general")
 
 # ----------------------------------------------------------------------
-# TRIANGULACION DE FUENTES
+# TRIANGULACION DE FUENTES - PASO 1: DENTRO DEL POOL DE RSS (gratis)
 # ----------------------------------------------------------------------
 
 def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
     """
-    Busca entre todos los candidatos una segunda nota que cubra el mismo
-    tema que el item principal, de una fuente distinta.
+    Busca entre los candidatos de RSS ya descargados una segunda nota que
+    cubra el mismo tema que el item principal, de una fuente distinta.
     Usa similitud Jaccard de palabras clave (titulo + resumen) como criterio.
     Devuelve el candidato más similar (si supera el umbral) o None.
     """
@@ -223,7 +234,6 @@ def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
     mejor_candidato = None
 
     for candidato in todos_los_candidatos:
-        # Descartar si es el mismo item o de la misma fuente
         if candidato["hash"] == item_principal["hash"]:
             continue
         if candidato["source"] == item_principal["source"]:
@@ -237,13 +247,92 @@ def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
             mejor_candidato = candidato
 
     if mejor_similitud >= SIMILITUD_MINIMA:
-        print(f"  🔗 Fuente secundaria encontrada ({mejor_similitud:.0%} similitud): "
+        print(f"  🔗 Fuente secundaria encontrada en RSS ({mejor_similitud:.0%} similitud): "
               f"{mejor_candidato['source']} — {mejor_candidato['title'][:60]}")
         return mejor_candidato
 
-    print(f"  ℹ️ No se encontró fuente secundaria con similitud suficiente "
+    print(f"  ℹ️ No se encontró fuente secundaria en el pool de RSS "
           f"(máx: {mejor_similitud:.0%}, umbral: {SIMILITUD_MINIMA:.0%})")
     return None
+
+# ----------------------------------------------------------------------
+# TRIANGULACION DE FUENTES - PASO 2: BUSQUEDA ACTIVA EN LA WEB (fallback)
+# ----------------------------------------------------------------------
+
+def buscar_fuentes_relacionadas(item, max_fuentes=MAX_FUENTES_ADICIONALES):
+    """
+    Busca en toda la web (via Google Custom Search, modo texto) noticias que
+    cubran el mismo tema que el item principal, en dominios distintos al
+    de origen. Devuelve una lista de hasta max_fuentes dicts compatibles
+    con el formato de 'candidato' que usa build_prompt.
+
+    Requiere que el motor de Programmable Search Engine tenga activado
+    "Search the entire web" en su configuracion (si no, solo va a buscar
+    dentro de los sitios especificos que tenga cargados, si tiene alguno).
+    """
+    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
+        print("  ⚠️ Sin credenciales de Google Search, no se puede buscar en la web.")
+        return []
+
+    query = " ".join(item["title"].split()[:10])
+    dominio_origen = _extraer_dominio(item["link"])
+    print(f"  🌐 Buscando fuentes relacionadas en la web para: '{query[:60]}...'")
+
+    params = {
+        "key": GOOGLE_SEARCH_API_KEY,
+        "cx": GOOGLE_SEARCH_ENGINE_ID,
+        "q": query,
+        "num": 10,
+        "safe": "active",
+        "dateRestrict": "d1",  # solo resultados de los ultimos 3 dias
+    }
+
+    try:
+        resp = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=15)
+        if resp.status_code != 200:
+            print(f"  ⚠️ Error Google Search (texto): {resp.status_code} — {resp.text[:200]}")
+            return []
+
+        items_resultado = resp.json().get("items", [])
+        if not items_resultado:
+            print("  ℹ️ No se encontraron resultados relacionados en la web.")
+            return []
+
+        fuentes = []
+        dominios_vistos = {dominio_origen}
+
+        for r in items_resultado:
+            link = r.get("link", "")
+            dominio = _extraer_dominio(link)
+
+            if not dominio or dominio in dominios_vistos:
+                continue
+            if any(excl in dominio for excl in DOMINIOS_EXCLUIDOS):
+                continue
+
+            fuentes.append({
+                "hash": item_hash({"link": link}),
+                "title": r.get("title", "Sin titulo"),
+                "link": link,
+                "summary": r.get("snippet", ""),
+                "source": r.get("displayLink", dominio),
+            })
+            dominios_vistos.add(dominio)
+
+            if len(fuentes) >= max_fuentes:
+                break
+
+        if fuentes:
+            print(f"  ✅ {len(fuentes)} fuente(s) relacionada(s) encontrada(s): "
+                  + ", ".join(f["source"] for f in fuentes))
+        else:
+            print("  ℹ️ Resultados encontrados, pero todos del mismo dominio o excluidos.")
+
+        return fuentes
+
+    except Exception as e:
+        print(f"  ⚠️ Excepción buscando fuentes relacionadas: {e}")
+        return []
 
 # ----------------------------------------------------------------------
 # BUSQUEDA DE IMAGEN VIA GOOGLE CUSTOM SEARCH
@@ -252,7 +341,8 @@ def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
 def buscar_imagen_google(query, fallback_url=None):
     """
     Busca una imagen relacionada con el tema del artículo usando
-    Google Custom Search API (100 búsquedas/día gratis).
+    Google Custom Search API (100 búsquedas/día gratis, comparte cuota
+    con las búsquedas de texto de buscar_fuentes_relacionadas).
     Devuelve la URL de la primera imagen encontrada, o fallback_url si falla.
     """
     if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
@@ -260,7 +350,6 @@ def buscar_imagen_google(query, fallback_url=None):
               "usando imagen de la fuente original.")
         return fallback_url
 
-    # Limitar el query a las primeras palabras más relevantes para mayor precisión
     query_corto = " ".join(query.split()[:8])
     print(f"🔍 Buscando imagen para: '{query_corto}'...")
 
@@ -269,9 +358,9 @@ def buscar_imagen_google(query, fallback_url=None):
         "cx": GOOGLE_SEARCH_ENGINE_ID,
         "q": query_corto,
         "searchType": "image",
-        "num": 5,                    # traer 5 y elegir la mejor
-        "imgSize": "large",          # imágenes grandes (mejor calidad para Instagram)
-        "imgType": "",           # tipo noticia, más relevante para tech
+        "num": 5,
+        "imgSize": "large",
+        "imgType": "",
         "safe": "active",
         "fileType": "jpg",
     }
@@ -281,7 +370,6 @@ def buscar_imagen_google(query, fallback_url=None):
         if resp.status_code == 200:
             items = resp.json().get("items", [])
             if items:
-                # Elegir la primera que no sea un logo pequeño
                 for item in items:
                     image_info = item.get("image", {})
                     width = image_info.get("width", 0)
@@ -290,7 +378,6 @@ def buscar_imagen_google(query, fallback_url=None):
                     if width >= 400 and height >= 300 and url:
                         print(f"✅ Imagen encontrada: {url[:80]}")
                         return url
-                # Si todas son pequeñas, devolver la primera igual
                 primera_url = items[0].get("link", "")
                 if primera_url:
                     print(f"✅ Imagen encontrada (sin filtro de tamaño): {primera_url[:80]}")
@@ -433,17 +520,21 @@ seleccionar las {MAX_ITEMS_PER_RUN} noticias MÁS RELEVANTES de la lista al fina
 de este mensaje, aplicando los criterios de abajo EN ORDEN DE PRIORIDAD.
 
 ===========================================
-CRITERIO 1 (máxima prioridad): LANZAMIENTOS OFICIALES DE HARDWARE, SOFTWARE, WEARABLES, GADGETS, TECNOLOGÍA PARA EL HOGAR 
+CRITERIO 1 (máxima prioridad): LANZAMIENTOS OFICIALES DE HARDWARE O SOFTWARE
 ===========================================
 Es la noticia PRIMARIA de un producto que sale al mercado, se anuncia
 oficialmente, o se actualiza con una versión nueva. La empresa fabricante
 o desarrolladora es quien hace el anuncio (no un tercero especulando).
 
-ejemplos:
+SI CALIFICA (ejemplos):
 - "Samsung presenta el Galaxy S26 con nuevo procesador propio"
 - "Apple lanza iOS 20 con rediseño completo de la interfaz"
 - "NVIDIA anuncia la nueva serie RTX 6000 para gaming"
 
+NO CALIFICA (ejemplos):
+- "Se filtran posibles specs del próximo iPhone" -> es rumor/filtración, no lanzamiento oficial
+- "5 cosas que esperamos ver en el próximo Galaxy Unpacked" -> es especulación/preview, no anuncio real
+- "Análisis: por qué el nuevo MacBook no convence" -> es opinión/review, no la noticia del lanzamiento en sí
 
 ===========================================
 CRITERIO 2: AVANCES REALES EN INTELIGENCIA ARTIFICIAL
@@ -452,12 +543,15 @@ Modelos nuevos, funciones nuevas lanzadas, o aplicaciones prácticas ya
 disponibles. Debe ser un avance concreto y verificable, no una promesa a futuro
 ni una reflexión general sobre "el futuro de la IA".
 
-ejemplos:
+SI CALIFICA (ejemplos):
 - "OpenAI lanza GPT-6 con capacidades de razonamiento mejoradas"
 - "Google integra Gemini directamente en Google Sheets"
 - "Anthropic presenta Claude con nueva función de memoria persistente"
 
-
+NO CALIFICA (ejemplos):
+- "Cómo la IA cambiará el trabajo en los próximos 10 años" -> es un ensayo/opinión, no una noticia de un avance concreto
+- "Empresas advierten sobre riesgos regulatorios de la IA" -> es cobertura de políticas/regulación, no un avance de producto
+- "Rumores indican que Meta prepara un nuevo modelo" -> es especulación sin confirmación oficial
 
 ===========================================
 CRITERIO 3: EMPRESAS DE TECNOLOGÍA (negociaciones, tratos, convenios)
@@ -465,11 +559,14 @@ CRITERIO 3: EMPRESAS DE TECNOLOGÍA (negociaciones, tratos, convenios)
 Adquisiciones, fusiones, rondas de inversión, alianzas estratégicas o
 convenios comerciales concretos y confirmados entre empresas.
 
-ejemplos:
+SI CALIFICA (ejemplos):
 - "Microsoft adquiere la startup de ciberseguridad XDR por USD 500 millones"
 - "Mercado Libre firma un convenio con Visa para pagos internacionales"
 - "Globant anuncia una ronda de inversión de USD 200 millones"
 
+NO CALIFICA (ejemplos):
+- "Las 10 empresas tech más valiosas del mundo en 2026" -> es un ranking/listicle, no una noticia de un trato concreto
+- "¿Podría Apple comprar Netflix?" -> es especulación, no una negociación confirmada
 
 ===========================================
 CRITERIO 4 (mínima prioridad): CIBERSEGURIDAD
@@ -477,11 +574,14 @@ CRITERIO 4 (mínima prioridad): CIBERSEGURIDAD
 Ataques reales ya ocurridos, vulnerabilidades críticas confirmadas (CVE,
 parches urgentes), o filtraciones de datos reales y verificadas.
 
-ejemplos:
+SI CALIFICA (ejemplos):
 - "Ransomware ataca los servidores de una aerolínea europea"
 - "Descubren vulnerabilidad crítica en routers de Cisco, ya hay parche disponible"
 - "Filtración expone datos de 2 millones de usuarios de una app de delivery"
 
+NO CALIFICA (ejemplos):
+- "10 consejos para protegerte de hackers" -> es contenido educativo genérico, no una noticia de un incidente real
+- "Los ciberataques más comunes en 2026" -> es un resumen/listicle, no un evento puntual
 
 ===========================================
 CRITERIO DE DESCARTE (aplica a cualquier categoría, siempre)
@@ -590,8 +690,6 @@ def fetch_new_relevant_items():
                 "categoria_reglas": categoria_reglas,
             }
 
-            # Pool amplio para triangulacion: cualquier nota relevante y reciente,
-            # aunque no llegue al score minimo de seleccion.
             candidatos_para_triangular.append(item_data)
 
             if score_reglas < 3:
@@ -635,41 +733,58 @@ def fetch_new_relevant_items():
     for it in seleccionados_final:
         print(f"  [{it['score_reglas']:>2}pts | {it['categoria_reglas']:<9}] {it['title'][:70]}")
 
-    # Devolvemos el pool AMPLIO para triangular, no solo los que pasaron score>=3
     return seleccionados_final, candidatos_para_triangular
 
 # ----------------------------------------------------------------------
-# CONSTRUCCION DEL PROMPT (con soporte para fuente secundaria)
+# CONSTRUCCION DEL PROMPT (soporta multiples fuentes adicionales)
 # ----------------------------------------------------------------------
 
-def build_prompt(item, full_text_principal, fuente_secundaria=None,
-                 full_text_secundario=None, imagen_url=None):
+def build_prompt(item, full_text_principal, fuentes_adicionales=None, imagen_url=None):
+    """
+    fuentes_adicionales: lista de dicts, cada uno con al menos
+    {title, source, link} y opcionalmente {summary, texto_completo}.
+    """
     text_limit = full_text_principal[:6000] if full_text_principal else item['summary']
+    fuentes_adicionales = fuentes_adicionales or []
 
     bloque_secundario = ""
-    if fuente_secundaria and full_text_secundario:
-        text_sec = full_text_secundario[:3000]
-        bloque_secundario = f"""
-FUENTE SECUNDARIA (segundo medio que cubre el mismo tema — usala para enriquecer,
-contrastar datos, o agregar perspectivas que no estén en la fuente principal):
-Título: {fuente_secundaria['title']}
-Medio: {fuente_secundaria['source']}
-URL: {fuente_secundaria['link']}
+    for idx, f in enumerate(fuentes_adicionales, 1):
+        texto = (f.get("texto_completo") or f.get("summary", ""))[:3000]
+        bloque_secundario += f"""
+FUENTE ADICIONAL {idx} (medio distinto que cubre el mismo tema — usala para
+cruzar datos, agregar perspectivas o detalles que no esten en la fuente
+principal):
+Título: {f['title']}
+Medio: {f['source']}
+URL: {f['link']}
 
-{text_sec}
-"""
-    elif fuente_secundaria:
-        bloque_secundario = f"""
-FUENTE SECUNDARIA (resumen del RSS, no se pudo extraer el artículo completo):
-Título: {fuente_secundaria['title']}
-Medio: {fuente_secundaria['source']}
-URL: {fuente_secundaria['link']}
-Resumen: {fuente_secundaria['summary']}
+{texto}
 """
 
     instruccion_imagen = ""
     if imagen_url:
         instruccion_imagen = f"\nImagen sugerida para el artículo (URL): {imagen_url}"
+
+    instruccion_fuentes = (
+        f"Tenés {len(fuentes_adicionales) + 1} fuentes sobre el mismo tema. Usalas todas para: "
+        f"(1) cruzar datos y mencionar si coinciden o difieren entre medios, "
+        f"(2) agregar perspectivas o detalles que solo tenga alguna de ellas. "
+        f"NO copies frases textuales de ninguna fuente."
+        if fuentes_adicionales else
+        "Redactá basándote en la fuente principal, parafraseando completamente y agregando contexto."
+    )
+
+    enlaces_instruccion = ""
+    if fuentes_adicionales:
+        partes = " / ".join(f"[texto natural]({f['link']})" for f in fuentes_adicionales)
+        enlaces_instruccion = (
+            f"- Incluí también un enlace hacia cada fuente adicional, en el punto del "
+            f"texto donde tenga sentido mencionarla, con este formato: {partes}"
+        )
+
+    fuentes_finales_str = item['source']
+    if fuentes_adicionales:
+        fuentes_finales_str += " y " + ", ".join(f['source'] for f in fuentes_adicionales)
 
     return f"""Actua como un redactor SEO senior especializado en tecnologia,
 con dominio experto de los criterios de puntuacion de Rank Math para WordPress,
@@ -687,7 +802,7 @@ TEXTO COMPLETO DEL ARTICULO PRINCIPAL:
 ===========================================
 INSTRUCCIONES DE REDACCION CON FUENTES MULTIPLES
 ===========================================
-{"Tenés DOS fuentes sobre el mismo tema. Usá ambas para: (1) cruzar datos, (2) agregar perspectivas o detalles que solo tenga una de las dos. NO copies frases textuales de ninguna fuente." if bloque_secundario else "Redactá basándote en la fuente principal, parafraseando completamente y agregando contexto."}
+{instruccion_fuentes}
 
 ===========================================
 PASO 1: DEFINI EL FOCUS KEYWORD (REGLAS SEMANTICAS ESTRICTAS)
@@ -768,9 +883,8 @@ Titulo de 50-60 caracteres. El focus keyword (string identico al de arriba)
 debe aparecer lo mas cerca posible del inicio del titulo.
 ANTES DE ESCRIBIRLO: aplica la Regla Critica #2. Identifica la primera palabra
 sustantiva del keyword y asegurate de que la plantilla del titulo NO la repita
-antes de insertar el keyword. Si el keyword ya es autosuficiente como titulo
-(ej: "herramienta T3MP3ST para pruebas de penetracion con Claude Code"), NO le
-agregues una frase envolvente generica delante — insertalo directo o
+antes de insertar el keyword. Si el keyword ya es autosuficiente como titulo,
+NO le agregues una frase envolvente generica delante — insertalo directo o
 antecedido por algo especifico de la noticia (un dato, una accion, un "asi").
 
 ## SLUG
@@ -850,7 +964,7 @@ El cuerpo de la nota en Markdown (600-900 palabras):
    - El PRIMER enlace externo va exactamente sobre la mención del focus
      keyword en el primer párrafo (el mismo lugar del punto 1), asi:
      [{{el string exacto del keyword}}]({item['link']})
-   {"- Incluí un segundo enlace hacia la fuente secundaria, en otro punto del texto donde tenga sentido, asi: [texto natural](" + fuente_secundaria['link'] + ")" if fuente_secundaria else ""}
+   {enlaces_instruccion}
 
 ===========================================
 VALIDACION FINAL OBLIGATORIA (haceła antes de responder)
@@ -877,7 +991,7 @@ FORMATO DE SALIDA
 Devolveme EXCLUSIVAMENTE los campos de arriba (FOCUS_KEYWORD, SEO_TITLE, SLUG,
 META_DESCRIPTION, H1, ARTICULO, ALT_TEXT) con esos encabezados exactos en
 Markdown. No agregues explicaciones fuera de esa estructura.
-Al final del ARTICULO, agrega: "Fuente: {item['source']}{f' y {fuente_secundaria["source"]}' if fuente_secundaria else ''}"
+Al final del ARTICULO, agrega: "Fuente: {fuentes_finales_str}"
 """
 
 # ----------------------------------------------------------------------
@@ -937,52 +1051,57 @@ def main():
         time.sleep(DELAY_ENTRE_FASES)
 
     for item in items:
-        print(f"\n{'='*60}")
-        print(f"📄 Procesando: {item['title'][:70]}...")
+    print(f"\n{'='*60}")
+    print(f"📄 Procesando: {item['title'][:70]}...")
 
-        # 1. Triangulacion: buscar fuente secundaria
-        print("🔗 Buscando fuente secundaria...")
-        fuente_secundaria = encontrar_fuente_secundaria(item, todos_los_candidatos)
+    # 1. Triangulacion, paso 1: busqueda activa en la web (prioridad)
+    print("🌐 Buscando fuentes relacionadas en la web...")
+    fuentes_adicionales = buscar_fuentes_relacionadas(item)
 
-        # 2. Extraer articulo principal
-        print("📥 Extrayendo fuente principal...")
-        full_article = extract_full_article(item['link'])
-        contenido_principal = (
-            full_article['text'] if full_article and full_article.get('text')
-            else item['summary']
+    if not fuentes_adicionales:
+        # 2. Si la web no devolvio nada util, caer al pool de RSS como respaldo
+        print("🔗 Sin resultados en la web, probando en el pool de RSS...")
+        fuente_rss = encontrar_fuente_secundaria(item, todos_los_candidatos)
+        if fuente_rss:
+            fuentes_adicionales = [fuente_rss]
+
+    # 3. Extraer el texto completo de cada fuente adicional encontrada
+    for f in fuentes_adicionales:
+        print(f"📥 Extrayendo fuente adicional: {f['source']}...")
+        full_sec = extract_full_article(f["link"])
+        f["texto_completo"] = (
+            full_sec["text"] if full_sec and full_sec.get("text")
+            else f.get("summary", "")
         )
 
-        # 3. Extraer fuente secundaria (si existe)
-        contenido_secundario = None
-        if fuente_secundaria:
-            print("📥 Extrayendo fuente secundaria...")
-            full_article_sec = extract_full_article(fuente_secundaria['link'])
-            contenido_secundario = (
-                full_article_sec['text'] if full_article_sec and full_article_sec.get('text')
-                else None
-            )
+    # 4. Extraer articulo principal
+    print("📥 Extrayendo fuente principal...")
+    full_article = extract_full_article(item['link'])
+    contenido_principal = (
+        full_article['text'] if full_article and full_article.get('text')
+        else item['summary']
+    )
 
-        # 4. Buscar imagen relevante con Google Custom Search
-        print("🖼️ Buscando imagen relevante...")
-        fallback_image = full_article.get('top_image') if full_article else None
-        imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
+    # 5. Buscar imagen relevante con Google Custom Search
+    print("🖼️ Buscando imagen relevante...")
+    fallback_image = full_article.get('top_image') if full_article else None
+    imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
 
-        # 5. Redactar con Gemini (con todo el contexto triangulado)
-        try:
-            prompt = build_prompt(
-                item,
-                contenido_principal,
-                fuente_secundaria=fuente_secundaria,
-                full_text_secundario=contenido_secundario,
-                imagen_url=imagen_url,
-            )
-            article = call_gemini(prompt)
-            save_draft(item, article, imagen_url=imagen_url)
+    # 6. Redactar con Gemini (con todo el contexto triangulado)
+    try:
+        prompt = build_prompt(
+            item,
+            contenido_principal,
+            fuentes_adicionales=fuentes_adicionales,
+            imagen_url=imagen_url,
+        )
+        article = call_gemini(prompt)
+        save_draft(item, article, imagen_url=imagen_url)
 
-        except Exception as e:
-            print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
+    except Exception as e:
+        print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
 
-        time.sleep(6)
+    time.sleep(6)
 
     print("\n✅ Pipeline finalizado.")
 
