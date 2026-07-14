@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.0 - Grounding + Cascada)
-=============================================================================
+Pipeline de automatizacion para tecno.ar (Hybrid 4.1 - Grounding + Cascada + Fixes)
+=====================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las mejores
-3. Triangulacion de fuentes: grounding de Gemini (el modelo busca y evalua en
-   tiempo real) como metodo principal; cascada de Custom Search como red de
-   seguridad ante fallos tecnicos del grounding
+3. Triangulacion de fuentes: grounding de Gemini (modelo fijo 2.5-flash, mas
+   estable en rate limit que los preview) como metodo principal; cascada de
+   Custom Search con filtro de relevancia real como respaldo
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
 5. Busqueda de imagen relevante via Google Custom Search API
 6. Redaccion con Gemini usando contenido triangulado (con retry, keyword semantico)
@@ -36,10 +36,23 @@ SEEN_FILE = BASE_DIR / "seen.json"
 DRAFTS_DIR = BASE_DIR / "drafts"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Modelo usado para redaccion y ranking (configurable).
 GEMINI_MODEL = "gemini-3-flash-preview"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+)
+
+# Modelo FIJO para el grounding de triangulacion. Los modelos -preview
+# (ej: gemini-3-flash-preview) tienen limites de RPM mucho mas bajos y
+# tiran 429 con facilidad en un pipeline que hace varias llamadas seguidas.
+# gemini-2.5-flash es estable y tiene 1.500 solicitudes/dia gratis con
+# grounding incluido, compartido con la cuota general de la API.
+GEMINI_GROUNDING_MODEL = "gemini-2.5-flash"
+GEMINI_GROUNDING_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_GROUNDING_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
 GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY")
@@ -58,7 +71,13 @@ SEARCH_BASE_BACKOFF = 3
 
 # Umbral de similitud para considerar que dos noticias del pool de RSS
 # cubren el mismo tema. Se calcula con Jaccard sobre palabras clave.
-SIMILITUD_MINIMA = 0.18
+SIMILITUD_MINIMA = 0.12
+
+# Umbral de relevancia minima para aceptar un resultado de la cascada de
+# respaldo (Custom Search). Sin sort=date, los resultados ya vienen
+# ordenados por relevancia de Google, pero este filtro extra evita colar
+# resultados de dominios/fecha validos pero tematicamente irrelevantes.
+UMBRAL_RELEVANCIA_CASCADA = 0.12
 
 # Sitios especificos donde buscar fuentes relacionadas en la cascada de
 # respaldo (se arma como OR de operadores site: dentro de la query).
@@ -168,6 +187,41 @@ def similitud_texto(a, b):
 def _extraer_dominio(url):
     match = re.search(r"https?://(?:www\.)?([^/]+)", url)
     return match.group(1).lower() if match else ""
+
+def _resolver_url_real(url_redirect, timeout=10):
+    """
+    Las URLs que devuelve el grounding de Gemini a veces son links de
+    redireccion de Google (vertexaisearch.cloud.google.com/grounding-api-redirect/...),
+    no la URL real de la fuente. Esta funcion sigue el redirect HTTP y
+    devuelve la URL final real, para usarla en el articulo y para poder
+    extraer el contenido completo despues.
+    """
+    if "vertexaisearch.cloud.google.com" not in url_redirect:
+        return url_redirect  # ya es una URL real, no hace falta resolver
+
+    try:
+        resp = requests.head(
+            url_redirect, timeout=timeout, allow_redirects=True,
+            headers=REQUEST_HEADERS,
+        )
+        if resp.url and "vertexaisearch.cloud.google.com" not in resp.url:
+            return resp.url
+    except requests.exceptions.RequestException:
+        pass
+
+    # Si HEAD falla (algunos servidores no lo soportan bien), probamos con GET
+    try:
+        resp = requests.get(
+            url_redirect, timeout=timeout, allow_redirects=True,
+            headers=REQUEST_HEADERS, stream=True,
+        )
+        resp.close()  # no necesitamos el body, solo la URL final
+        if resp.url and "vertexaisearch.cloud.google.com" not in resp.url:
+            return resp.url
+    except requests.exceptions.RequestException as e:
+        print(f"    ⚠️ No se pudo resolver la URL de redirección: {e}")
+
+    return url_redirect  # si todo falla, devolvemos la original (mejor que nada)
 
 def _google_search_con_reintentos(params, contexto=""):
     """
@@ -282,14 +336,55 @@ def compute_relevance_score(entry_text):
 # TRIANGULACION - METODO PRINCIPAL: GROUNDING CON GOOGLE SEARCH DE GEMINI
 # ----------------------------------------------------------------------
 
+def call_gemini_grounding_api(payload, context="grounding", retries=GEMINI_MAX_RETRIES):
+    """
+    Igual que call_gemini_api, pero apunta siempre a GEMINI_GROUNDING_URL
+    (modelo fijo gemini-2.5-flash) en vez de al modelo configurable
+    GEMINI_MODEL, para evitar los limites de RPM mas estrictos de modelos
+    -preview cuando se usan para triangulacion.
+    """
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY")
+
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            resp = requests.post(GEMINI_GROUNDING_URL, json=payload, timeout=60)
+
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code == 429:
+                wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
+                print(f"[RATE LIMIT] {context}: intento {attempt + 1}/{retries}, esperando {wait}s...")
+                time.sleep(wait)
+                last_error = RuntimeError(f"429 rate limit tras {retries} intentos ({context})")
+                continue
+            elif resp.status_code >= 500:
+                wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
+                print(f"[SERVER ERROR] {context}: {resp.status_code}, esperando {wait}s...")
+                time.sleep(wait)
+                last_error = RuntimeError(f"Error {resp.status_code} ({context})")
+                continue
+            else:
+                raise RuntimeError(f"Error Gemini {resp.status_code} ({context}): {resp.text[:300]}")
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
+            print(f"[NETWORK ERROR] {context}: {type(e).__name__}, esperando {wait}s...")
+            time.sleep(wait)
+            last_error = e
+            continue
+
+    raise RuntimeError(f"Se agotaron los reintentos en {context}: {last_error}")
+
 def buscar_fuentes_con_grounding(item, max_fuentes=MAX_FUENTES_ADICIONALES):
     """
-    Usa la herramienta de Grounding con Google Search de Gemini para que el
-    propio modelo busque en tiempo real fuentes que cubran el mismo tema que
-    el item principal, evaluando semanticamente cuales son relevantes (no
-    solo por coincidencia de dominio o de palabras clave). Gratis hasta
-    1.500 solicitudes/dia con gemini-2.5-flash, compartido con la cuota
-    general de la API.
+    Usa la herramienta de Grounding con Google Search de Gemini (modelo fijo
+    gemini-2.5-flash, ver GEMINI_GROUNDING_MODEL) para que el propio modelo
+    busque en tiempo real fuentes que cubran el mismo tema que el item
+    principal, evaluando semanticamente cuales son relevantes. Gratis hasta
+    1.500 solicitudes/dia, compartido con la cuota general de la API.
 
     Devuelve:
     - Una lista (posiblemente vacia) si la llamada funciono correctamente.
@@ -326,8 +421,9 @@ Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
     }
 
     try:
-        print(f"    🔎 Buscando con grounding de Gemini: '{item['title'][:60]}...'")
-        data = call_gemini_api(payload, context="grounding-triangulacion")
+        print(f"    🔎 Buscando con grounding de Gemini ({GEMINI_GROUNDING_MODEL}): "
+              f"'{item['title'][:60]}...'")
+        data = call_gemini_grounding_api(payload, context="grounding-triangulacion")
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
 
         # Gemini a veces envuelve el JSON en ```json ... ```, lo limpiamos
@@ -340,9 +436,16 @@ Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
         dominios_vistos = {dominio_origen}
 
         for f in fuentes_crudas:
-            link = f.get("link", "")
+            link_original = f.get("link", "")
+            if not link_original:
+                continue
+
+            # Resolver la URL de redireccion de Google (vertexaisearch...)
+            # a la URL real de la fuente antes de filtrar por dominio.
+            link = _resolver_url_real(link_original)
             dominio = _extraer_dominio(link)
-            if not link or not dominio or dominio in dominios_vistos:
+
+            if not dominio or dominio in dominios_vistos:
                 continue
             if any(excl in dominio for excl in DOMINIOS_EXCLUIDOS):
                 continue
@@ -405,10 +508,15 @@ def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
 
     return None
 
-def _ejecutar_busqueda_texto(query, date_restrict, dominio_origen, max_fuentes):
+def _ejecutar_busqueda_texto(query, date_restrict, dominio_origen, max_fuentes, titulo_original=""):
     """
     Ejecuta una busqueda de texto puntual contra Custom Search y devuelve
-    una lista de fuentes ya filtradas por dominio.
+    una lista de fuentes filtradas por dominio Y por relevancia real
+    (Jaccard contra el titulo original). NO usa sort=date, porque ese
+    parametro prioriza la fecha por encima de la relevancia y puede traer
+    resultados recientes pero tematicamente irrelevantes (ver bug detectado
+    con la noticia de iOS 27, donde trajo notas de Waze y de seguridad
+    infantil sin ninguna relacion con el tema real).
     """
     params = {
         "key": GOOGLE_SEARCH_API_KEY,
@@ -417,7 +525,6 @@ def _ejecutar_busqueda_texto(query, date_restrict, dominio_origen, max_fuentes):
         "num": 10,
         "safe": "active",
         "dateRestrict": date_restrict,
-        "sort": "date",
     }
 
     data = _google_search_con_reintentos(params, contexto=f"texto ({date_restrict})")
@@ -439,6 +546,17 @@ def _ejecutar_busqueda_texto(query, date_restrict, dominio_origen, max_fuentes):
             continue
         if any(excl in dominio for excl in DOMINIOS_EXCLUIDOS):
             continue
+
+        # Filtro de relevancia real: el resultado tiene que compartir
+        # palabras clave con el titulo original, sino se descarta aunque
+        # el dominio y la fecha sean validos.
+        titulo_resultado = r.get("title", "") + " " + r.get("snippet", "")
+        if titulo_original:
+            sim = similitud_texto(titulo_original, titulo_resultado)
+            if sim < UMBRAL_RELEVANCIA_CASCADA:
+                print(f"    ⏭️ Descartado por baja relevancia ({sim:.0%}): "
+                      f"{dominio} — {r.get('title', '')[:50]}")
+                continue
 
         fuentes.append({
             "hash": item_hash({"link": link}),
@@ -468,22 +586,23 @@ def buscar_fuentes_cascada_respaldo(item, todos_los_candidatos, max_fuentes=MAX_
     query_base = " ".join(item["title"].split()[:10])
     dominio_origen = _extraer_dominio(item["link"])
     filtro_sitios = " OR ".join(f"site:{s}" for s in SITIOS_REFERENCIA_BUSQUEDA)
+    titulo_original = item["title"]
 
     print("    [Respaldo 1] Sitios de referencia, últimas 24hs...")
     query_n1 = f"({filtro_sitios}) {query_base}"
-    fuentes = _ejecutar_busqueda_texto(query_n1, "d1", dominio_origen, max_fuentes)
+    fuentes = _ejecutar_busqueda_texto(query_n1, "d1", dominio_origen, max_fuentes, titulo_original)
     if fuentes:
         print(f"    ✅ Respaldo 1 exitoso: {', '.join(f['source'] for f in fuentes)}")
         return fuentes
 
     print("    [Respaldo 2] Sitios de referencia, últimas 72hs...")
-    fuentes = _ejecutar_busqueda_texto(query_n1, "d3", dominio_origen, max_fuentes)
+    fuentes = _ejecutar_busqueda_texto(query_n1, "d3", dominio_origen, max_fuentes, titulo_original)
     if fuentes:
         print(f"    ✅ Respaldo 2 exitoso: {', '.join(f['source'] for f in fuentes)}")
         return fuentes
 
     print("    [Respaldo 3] Web abierta (sin restricción de sitio), últimas 48hs...")
-    fuentes = _ejecutar_busqueda_texto(query_base, "d2", dominio_origen, max_fuentes)
+    fuentes = _ejecutar_busqueda_texto(query_base, "d2", dominio_origen, max_fuentes, titulo_original)
     if fuentes:
         print(f"    ✅ Respaldo 3 exitoso: {', '.join(f['source'] for f in fuentes)}")
         return fuentes
@@ -521,7 +640,7 @@ def buscar_imagen_google(query, fallback_url=None):
         "searchType": "image",
         "num": 5,
         "imgSize": "large",
-        "imgType": "",
+        "imgType": "photo",
         "safe": "active",
         "fileType": "jpg",
     }
@@ -613,7 +732,7 @@ def extract_full_article(url):
     return None
 
 # ----------------------------------------------------------------------
-# HELPER COMPARTIDO: LLAMADA A GEMINI CON RETRY/BACKOFF
+# HELPER COMPARTIDO: LLAMADA A GEMINI CON RETRY/BACKOFF (redaccion/ranking)
 # ----------------------------------------------------------------------
 
 def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES):
@@ -1188,8 +1307,11 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.0 (grounding de Gemini + cascada de respaldo)...")
+    print("🚀 Iniciando pipeline Hybrid 4.1 (grounding fijo 2.5-flash + cascada con "
+          "filtro de relevancia)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
+    print(f"DEBUG: GEMINI_MODEL (redacción/ranking) = {GEMINI_MODEL}")
+    print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación) = {GEMINI_GROUNDING_MODEL}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
     print(f"DEBUG: GOOGLE_SEARCH_ENGINE_ID {'OK' if GOOGLE_SEARCH_ENGINE_ID else 'FALTA'}")
 
