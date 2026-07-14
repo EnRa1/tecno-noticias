@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 2.0 + Articulo Completo)
-==========================================================================
+Pipeline de automatizacion para tecno.ar (Hybrid 4.0 - Grounding + Cascada)
+=============================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las mejores
-3. Triangulacion de fuentes: busqueda activa en sitios de referencia primero,
-   pool de RSS como respaldo
+3. Triangulacion de fuentes: grounding de Gemini (el modelo busca y evalua en
+   tiempo real) como metodo principal; cascada de Custom Search como red de
+   seguridad ante fallos tecnicos del grounding
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
 5. Busqueda de imagen relevante via Google Custom Search API
 6. Redaccion con Gemini usando contenido triangulado (con retry, keyword semantico)
@@ -52,35 +53,45 @@ GEMINI_MAX_RETRIES = 4
 GEMINI_BASE_BACKOFF = 8
 
 MAX_FUENTES_ADICIONALES = 2
+SEARCH_MAX_RETRIES = 2
+SEARCH_BASE_BACKOFF = 3
 
 # Umbral de similitud para considerar que dos noticias del pool de RSS
 # cubren el mismo tema. Se calcula con Jaccard sobre palabras clave.
 SIMILITUD_MINIMA = 0.18
 
-# Sitios especificos donde buscar fuentes relacionadas (se arma como OR de
-# operadores site: dentro de la query de Google Custom Search). Editá esta
-# lista libremente para sumar o sacar medios de referencia.
+# Sitios especificos donde buscar fuentes relacionadas en la cascada de
+# respaldo (se arma como OR de operadores site: dentro de la query).
 SITIOS_REFERENCIA_BUSQUEDA = [
     "techcrunch.com",
     "theverge.com",
     "wired.com",
+    "arstechnica.com",
     "engadget.com",
+    "gizmodo.com",
+    "xataka.com",
     "genbeta.com",
     "hipertextual.com",
     "infobae.com",
+    "clarin.com",
+    "ambito.com",
     "blog.google",
     "news.microsoft.com",
     "openai.com",
+    "anthropic.com",
     "thehackernews.com",
     "bleepingcomputer.com",
-    "reuters.com"
+    "krebsonsecurity.com",
+    "9to5mac.com",
+    "9to5google.com",
+    "androidauthority.com",
 ]
 
-# Dominios que no cuentan como "fuente distinta" util al triangular via web
+# Dominios que no cuentan como "fuente distinta" util al triangular
 # (agregadores, redes sociales; el dominio de origen se excluye dinamicamente).
 DOMINIOS_EXCLUIDOS = {
     "twitter.com", "x.com", "facebook.com", "reddit.com",
-    "youtube.com", "tecno.ar",
+    "youtube.com", "tecno.ar", "news.google.com",
 }
 
 REQUEST_HEADERS = {
@@ -145,10 +156,7 @@ def tokenizar(texto):
 def similitud_texto(a, b):
     """
     Calcula similitud entre dos strings (0.0 a 1.0) usando el indice de Jaccard
-    sobre palabras clave. Es mas robusto que un diff de caracteres (SequenceMatcher)
-    porque dos notas que cubren el mismo hecho con redaccion distinta van a compartir
-    las palabras clave (nombres propios, terminos tecnicos) aunque el orden y la
-    redaccion sean completamente diferentes.
+    sobre palabras clave.
     """
     set_a, set_b = tokenizar(a), tokenizar(b)
     if not set_a or not set_b:
@@ -160,6 +168,38 @@ def similitud_texto(a, b):
 def _extraer_dominio(url):
     match = re.search(r"https?://(?:www\.)?([^/]+)", url)
     return match.group(1).lower() if match else ""
+
+def _google_search_con_reintentos(params, contexto=""):
+    """
+    Ejecuta una llamada a Google Custom Search con reintentos ante errores
+    transitorios de red o 5xx. Devuelve la respuesta JSON o None si fallan
+    todos los intentos.
+    """
+    for intento in range(SEARCH_MAX_RETRIES + 1):
+        try:
+            resp = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=15)
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code >= 500 and intento < SEARCH_MAX_RETRIES:
+                wait = SEARCH_BASE_BACKOFF * (intento + 1)
+                print(f"    ⚠️ Error {resp.status_code} en {contexto}, "
+                      f"reintentando en {wait}s...")
+                time.sleep(wait)
+                continue
+            else:
+                print(f"    ⚠️ Error Google Search ({contexto}): "
+                      f"{resp.status_code} — {resp.text[:200]}")
+                return None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if intento < SEARCH_MAX_RETRIES:
+                wait = SEARCH_BASE_BACKOFF * (intento + 1)
+                print(f"    ⚠️ Error de red en {contexto} ({type(e).__name__}), "
+                      f"reintentando en {wait}s...")
+                time.sleep(wait)
+                continue
+            print(f"    ⚠️ Excepción de red agotó reintentos en {contexto}: {e}")
+            return None
+    return None
 
 # ----------------------------------------------------------------------
 # FILTRO POR FECHA
@@ -239,19 +279,107 @@ def compute_relevance_score(entry_text):
     return max(0, min(10, score)), (categorias[0] if categorias else "general")
 
 # ----------------------------------------------------------------------
-# TRIANGULACION DE FUENTES - RESPALDO: DENTRO DEL POOL DE RSS (gratis)
+# TRIANGULACION - METODO PRINCIPAL: GROUNDING CON GOOGLE SEARCH DE GEMINI
+# ----------------------------------------------------------------------
+
+def buscar_fuentes_con_grounding(item, max_fuentes=MAX_FUENTES_ADICIONALES):
+    """
+    Usa la herramienta de Grounding con Google Search de Gemini para que el
+    propio modelo busque en tiempo real fuentes que cubran el mismo tema que
+    el item principal, evaluando semanticamente cuales son relevantes (no
+    solo por coincidencia de dominio o de palabras clave). Gratis hasta
+    1.500 solicitudes/dia con gemini-2.5-flash, compartido con la cuota
+    general de la API.
+
+    Devuelve:
+    - Una lista (posiblemente vacia) si la llamada funciono correctamente.
+    - None si hubo un fallo tecnico real (para distinguir "no encontro nada"
+      de "la llamada fallo", y asi decidir si conviene caer a la cascada
+      de respaldo).
+    """
+    if not GEMINI_API_KEY:
+        print("    ⚠️ Sin GEMINI_API_KEY, no se puede usar grounding.")
+        return None
+
+    prompt = f"""
+Busca en la web noticias RECIENTES (ultimas 24-48 horas) que cubran el mismo
+hecho o tema que esta noticia:
+
+Titulo: {item['title']}
+Resumen: {item['summary'][:300]}
+
+Encuentra hasta {max_fuentes} articulos de medios DISTINTOS a "{item['source']}"
+que hablen especificamente de este mismo evento (no articulos genericos sobre
+el tema general, sino cobertura del mismo hecho puntual).
+
+Devolveme SOLO un JSON con este formato exacto, sin texto adicional:
+{{"fuentes": [{{"title": "titulo del articulo", "source": "nombre del medio",
+"link": "URL completa del articulo"}}]}}
+
+Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
+"""
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.1},
+    }
+
+    try:
+        print(f"    🔎 Buscando con grounding de Gemini: '{item['title'][:60]}...'")
+        data = call_gemini_api(payload, context="grounding-triangulacion")
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+        # Gemini a veces envuelve el JSON en ```json ... ```, lo limpiamos
+        raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
+        result = json.loads(raw_text)
+        fuentes_crudas = result.get("fuentes", [])
+
+        fuentes = []
+        dominio_origen = _extraer_dominio(item["link"])
+        dominios_vistos = {dominio_origen}
+
+        for f in fuentes_crudas:
+            link = f.get("link", "")
+            dominio = _extraer_dominio(link)
+            if not link or not dominio or dominio in dominios_vistos:
+                continue
+            if any(excl in dominio for excl in DOMINIOS_EXCLUIDOS):
+                continue
+
+            fuentes.append({
+                "hash": item_hash({"link": link}),
+                "title": f.get("title", "Sin titulo"),
+                "link": link,
+                "summary": "",
+                "source": f.get("source", dominio),
+            })
+            dominios_vistos.add(dominio)
+
+            if len(fuentes) >= max_fuentes:
+                break
+
+        if fuentes:
+            print(f"    ✅ Grounding encontró {len(fuentes)} fuente(s): "
+                  + ", ".join(f["source"] for f in fuentes))
+        else:
+            print("    ℹ️ Grounding no encontró fuentes adicionales relevantes.")
+
+        return fuentes
+
+    except Exception as e:
+        print(f"    ⚠️ Excepción usando grounding ({e}), se probará la cascada de respaldo.")
+        return None
+
+# ----------------------------------------------------------------------
+# TRIANGULACION - RESPALDO: CASCADA DE CUSTOM SEARCH + POOL DE RSS
 # ----------------------------------------------------------------------
 
 def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
     """
     Busca entre los candidatos de RSS ya descargados una segunda nota que
-    cubra el mismo tema que el item principal, de una fuente distinta.
-
-    Como se comparan las notas: se convierte el titulo+resumen de cada una en
-    un conjunto de palabras clave (sacando stopwords), y se calcula el indice
-    de Jaccard (interseccion / union) entre ambos conjuntos. Si el resultado
-    supera SIMILITUD_MINIMA, se consideran del mismo tema. Es un calculo
-    matematico local, no llama a ninguna API externa.
+    cubra el mismo tema, usando el indice de Jaccard sobre palabras clave.
+    Calculo local, no gasta cuota de ninguna API externa.
     """
     texto_principal = item_principal["title"] + " " + item_principal["summary"]
     mejor_similitud = 0
@@ -271,108 +399,103 @@ def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
             mejor_candidato = candidato
 
     if mejor_similitud >= SIMILITUD_MINIMA:
-        print(f"  🔗 Fuente secundaria encontrada en RSS ({mejor_similitud:.0%} similitud): "
+        print(f"    🔗 Match en pool de RSS ({mejor_similitud:.0%} similitud): "
               f"{mejor_candidato['source']} — {mejor_candidato['title'][:60]}")
         return mejor_candidato
 
-    print(f"  ℹ️ No se encontró fuente secundaria en el pool de RSS "
-          f"(máx: {mejor_similitud:.0%}, umbral: {SIMILITUD_MINIMA:.0%})")
     return None
 
-# ----------------------------------------------------------------------
-# TRIANGULACION DE FUENTES - PRIORIDAD: BUSQUEDA EN SITIOS DE REFERENCIA
-# ----------------------------------------------------------------------
-
-def buscar_fuentes_relacionadas(item, max_fuentes=MAX_FUENTES_ADICIONALES):
+def _ejecutar_busqueda_texto(query, date_restrict, dominio_origen, max_fuentes):
     """
-    Busca noticias que cubran el mismo tema que el item principal, mediante
-    Google Custom Search, restringido unicamente a los dominios listados en
-    SITIOS_REFERENCIA_BUSQUEDA (usando el operador site: dentro de la query).
-
-    Como determina la relacion tematica: no hay calculo de similitud propio
-    aca. El titulo del item se manda como query de texto a Google, y es el
-    propio motor de busqueda quien decide que resultados son relevantes para
-    esa query (algoritmo interno de Google, no controlado por este codigo).
-    Este codigo solo filtra los resultados por dominio permitido/excluido y
-    arma la lista final.
-
-    Nota sobre la ventana de tiempo: dateRestrict="d1" es la granularidad
-    minima oficial que soporta la API (1 dia). No existe un valor equivalente
-    a "12 horas" en este parametro.
+    Ejecuta una busqueda de texto puntual contra Custom Search y devuelve
+    una lista de fuentes ya filtradas por dominio.
     """
-    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
-        print("  ⚠️ Sin credenciales de Google Search, no se puede buscar en la web.")
-        return []
-
-    if not SITIOS_REFERENCIA_BUSQUEDA:
-        print("  ⚠️ SITIOS_REFERENCIA_BUSQUEDA esta vacia, no hay donde buscar.")
-        return []
-
-    query_base = " ".join(item["title"].split()[:10])
-    dominio_origen = _extraer_dominio(item["link"])
-
-    # Arma: (site:techcrunch.com OR site:theverge.com OR ...) titulo de la noticia
-    filtro_sitios = " OR ".join(f"site:{s}" for s in SITIOS_REFERENCIA_BUSQUEDA)
-    query = f"({filtro_sitios}) {query_base}"
-
-    print(f"  🌐 Buscando en sitios de referencia para: '{query_base[:60]}...'")
-
     params = {
         "key": GOOGLE_SEARCH_API_KEY,
         "cx": GOOGLE_SEARCH_ENGINE_ID,
         "q": query,
         "num": 10,
         "safe": "active",
-        "dateRestrict": "d1",  # ultimas 24 horas (minimo oficial soportado)
-        "sort": "date",        # prioriza resultados mas recientes primero
+        "dateRestrict": date_restrict,
+        "sort": "date",
     }
 
-    try:
-        resp = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=15)
-        if resp.status_code != 200:
-            print(f"  ⚠️ Error Google Search (texto): {resp.status_code} — {resp.text[:200]}")
-            return []
+    data = _google_search_con_reintentos(params, contexto=f"texto ({date_restrict})")
+    if not data:
+        return []
 
-        items_resultado = resp.json().get("items", [])
-        if not items_resultado:
-            print("  ℹ️ No se encontraron resultados en los sitios de referencia.")
-            return []
+    items_resultado = data.get("items", [])
+    if not items_resultado:
+        return []
 
-        fuentes = []
-        dominios_vistos = {dominio_origen}
+    fuentes = []
+    dominios_vistos = {dominio_origen}
 
-        for r in items_resultado:
-            link = r.get("link", "")
-            dominio = _extraer_dominio(link)
+    for r in items_resultado:
+        link = r.get("link", "")
+        dominio = _extraer_dominio(link)
 
-            if not dominio or dominio in dominios_vistos:
-                continue
-            if any(excl in dominio for excl in DOMINIOS_EXCLUIDOS):
-                continue
+        if not dominio or dominio in dominios_vistos:
+            continue
+        if any(excl in dominio for excl in DOMINIOS_EXCLUIDOS):
+            continue
 
-            fuentes.append({
-                "hash": item_hash({"link": link}),
-                "title": r.get("title", "Sin titulo"),
-                "link": link,
-                "summary": r.get("snippet", ""),
-                "source": r.get("displayLink", dominio),
-            })
-            dominios_vistos.add(dominio)
+        fuentes.append({
+            "hash": item_hash({"link": link}),
+            "title": r.get("title", "Sin titulo"),
+            "link": link,
+            "summary": r.get("snippet", ""),
+            "source": r.get("displayLink", dominio),
+        })
+        dominios_vistos.add(dominio)
 
-            if len(fuentes) >= max_fuentes:
-                break
+        if len(fuentes) >= max_fuentes:
+            break
 
-        if fuentes:
-            print(f"  ✅ {len(fuentes)} fuente(s) relacionada(s) encontrada(s): "
-                  + ", ".join(f["source"] for f in fuentes))
-        else:
-            print("  ℹ️ Resultados encontrados, pero todos descartados por dominio.")
+    return fuentes
 
+def buscar_fuentes_cascada_respaldo(item, todos_los_candidatos, max_fuentes=MAX_FUENTES_ADICIONALES):
+    """
+    Cascada de respaldo (4 niveles) que se usa SOLO si el grounding de
+    Gemini fallo tecnicamente (devolvio None, no si simplemente no
+    encontro fuentes). Va de mas preciso a mas amplio.
+    """
+    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
+        print("    ⚠️ Sin credenciales de Google Search, saltando cascada de respaldo.")
+        fuente_rss = encontrar_fuente_secundaria(item, todos_los_candidatos)
+        return [fuente_rss] if fuente_rss else []
+
+    query_base = " ".join(item["title"].split()[:10])
+    dominio_origen = _extraer_dominio(item["link"])
+    filtro_sitios = " OR ".join(f"site:{s}" for s in SITIOS_REFERENCIA_BUSQUEDA)
+
+    print("    [Respaldo 1] Sitios de referencia, últimas 24hs...")
+    query_n1 = f"({filtro_sitios}) {query_base}"
+    fuentes = _ejecutar_busqueda_texto(query_n1, "d1", dominio_origen, max_fuentes)
+    if fuentes:
+        print(f"    ✅ Respaldo 1 exitoso: {', '.join(f['source'] for f in fuentes)}")
         return fuentes
 
-    except Exception as e:
-        print(f"  ⚠️ Excepción buscando fuentes relacionadas: {e}")
-        return []
+    print("    [Respaldo 2] Sitios de referencia, últimas 72hs...")
+    fuentes = _ejecutar_busqueda_texto(query_n1, "d3", dominio_origen, max_fuentes)
+    if fuentes:
+        print(f"    ✅ Respaldo 2 exitoso: {', '.join(f['source'] for f in fuentes)}")
+        return fuentes
+
+    print("    [Respaldo 3] Web abierta (sin restricción de sitio), últimas 48hs...")
+    fuentes = _ejecutar_busqueda_texto(query_base, "d2", dominio_origen, max_fuentes)
+    if fuentes:
+        print(f"    ✅ Respaldo 3 exitoso: {', '.join(f['source'] for f in fuentes)}")
+        return fuentes
+
+    print("    [Respaldo 4] Pool de RSS local...")
+    fuente_rss = encontrar_fuente_secundaria(item, todos_los_candidatos)
+    if fuente_rss:
+        print(f"    ✅ Respaldo 4 exitoso: {fuente_rss['source']}")
+        return [fuente_rss]
+
+    print("    ℹ️ Cascada de respaldo completa sin resultados.")
+    return []
 
 # ----------------------------------------------------------------------
 # BUSQUEDA DE IMAGEN VIA GOOGLE CUSTOM SEARCH
@@ -381,13 +504,11 @@ def buscar_fuentes_relacionadas(item, max_fuentes=MAX_FUENTES_ADICIONALES):
 def buscar_imagen_google(query, fallback_url=None):
     """
     Busca una imagen relacionada con el tema del artículo usando
-    Google Custom Search API (100 búsquedas/día gratis, comparte cuota
-    con las búsquedas de texto de buscar_fuentes_relacionadas).
-    Devuelve la URL de la primera imagen encontrada, o fallback_url si falla.
+    Google Custom Search API. Devuelve la URL de la primera imagen
+    encontrada, o fallback_url si falla.
     """
     if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
-        print("⚠️ Sin credenciales de Google Search (revisar env vars del workflow), "
-              "usando imagen de la fuente original.")
+        print("⚠️ Sin credenciales de Google Search, usando imagen de la fuente original.")
         return fallback_url
 
     query_corto = " ".join(query.split()[:8])
@@ -405,27 +526,22 @@ def buscar_imagen_google(query, fallback_url=None):
         "fileType": "jpg",
     }
 
-    try:
-        resp = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=15)
-        if resp.status_code == 200:
-            items = resp.json().get("items", [])
-            if items:
-                for item in items:
-                    image_info = item.get("image", {})
-                    width = image_info.get("width", 0)
-                    height = image_info.get("height", 0)
-                    url = item.get("link", "")
-                    if width >= 400 and height >= 300 and url:
-                        print(f"✅ Imagen encontrada: {url[:80]}")
-                        return url
-                primera_url = items[0].get("link", "")
-                if primera_url:
-                    print(f"✅ Imagen encontrada (sin filtro de tamaño): {primera_url[:80]}")
-                    return primera_url
-        else:
-            print(f"⚠️ Error Google Search API: {resp.status_code} — {resp.text[:200]}")
-    except Exception as e:
-        print(f"⚠️ Excepción buscando imagen: {e}")
+    data = _google_search_con_reintentos(params, contexto="imagen")
+    if data:
+        items = data.get("items", [])
+        if items:
+            for item in items:
+                image_info = item.get("image", {})
+                width = image_info.get("width", 0)
+                height = image_info.get("height", 0)
+                url = item.get("link", "")
+                if width >= 400 and height >= 300 and url:
+                    print(f"✅ Imagen encontrada: {url[:80]}")
+                    return url
+            primera_url = items[0].get("link", "")
+            if primera_url:
+                print(f"✅ Imagen encontrada (sin filtro de tamaño): {primera_url[:80]}")
+                return primera_url
 
     print("⚠️ No se encontró imagen, usando imagen de la fuente original.")
     return fallback_url
@@ -696,7 +812,7 @@ MAX_POR_FUENTE = max(1, MAX_ITEMS_PER_RUN // 2)
 def fetch_new_relevant_items():
     seen = load_seen()
     candidatos = []
-    candidatos_para_triangular = []  # pool amplio, sin filtro de score_reglas>=3
+    candidatos_para_triangular = []
 
     for url in load_feeds():
         try:
@@ -1051,12 +1167,6 @@ def call_gemini(prompt):
 # ----------------------------------------------------------------------
 
 def save_draft(item, article_md, imagen_url=None):
-    """
-    Guarda el borrador en drafts/. El header incluye la URL de la imagen
-    encontrada por Google Custom Search (o fallback de la fuente original),
-    para que publish_to_wordpress.py pueda descargarla y subirla como
-    imagen destacada en el step siguiente del workflow.
-    """
     DRAFTS_DIR.mkdir(exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = f"{date_str}_{slugify(item['title'])}.md"
@@ -1078,7 +1188,7 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 2.0 con triangulacion de fuentes e imagen IA...")
+    print("🚀 Iniciando pipeline Hybrid 4.0 (grounding de Gemini + cascada de respaldo)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
     print(f"DEBUG: GOOGLE_SEARCH_ENGINE_ID {'OK' if GOOGLE_SEARCH_ENGINE_ID else 'FALTA'}")
@@ -1094,18 +1204,16 @@ def main():
         print(f"\n{'='*60}")
         print(f"📄 Procesando: {item['title'][:70]}...")
 
-        # 1. Triangulacion, prioridad: busqueda activa en sitios de referencia
-        print("🌐 Buscando fuentes relacionadas en sitios de referencia...")
-        fuentes_adicionales = buscar_fuentes_relacionadas(item)
+        # 1. Triangulacion: grounding de Gemini primero (el modelo busca y evalua)
+        print("🔎 Ejecutando triangulación con grounding de Gemini...")
+        fuentes_adicionales = buscar_fuentes_con_grounding(item)
 
-        if not fuentes_adicionales:
-            # 2. Respaldo: si la busqueda web no encontro nada, probar en el pool de RSS
-            print("🔗 Sin resultados en la web, probando en el pool de RSS...")
-            fuente_rss = encontrar_fuente_secundaria(item, todos_los_candidatos)
-            if fuente_rss:
-                fuentes_adicionales = [fuente_rss]
+        if fuentes_adicionales is None:
+            # Fallo tecnico real (no "no encontro nada"): cascada de respaldo
+            print("🔎 Grounding falló técnicamente, usando cascada de respaldo...")
+            fuentes_adicionales = buscar_fuentes_cascada_respaldo(item, todos_los_candidatos)
 
-        # 3. Extraer el texto completo de cada fuente adicional encontrada
+        # 2. Extraer el texto completo de cada fuente adicional encontrada
         for f in fuentes_adicionales:
             print(f"📥 Extrayendo fuente adicional: {f['source']}...")
             full_sec = extract_full_article(f["link"])
@@ -1114,7 +1222,7 @@ def main():
                 else f.get("summary", "")
             )
 
-        # 4. Extraer articulo principal
+        # 3. Extraer articulo principal
         print("📥 Extrayendo fuente principal...")
         full_article = extract_full_article(item['link'])
         contenido_principal = (
@@ -1122,12 +1230,12 @@ def main():
             else item['summary']
         )
 
-        # 5. Buscar imagen relevante con Google Custom Search
+        # 4. Buscar imagen relevante con Google Custom Search
         print("🖼️ Buscando imagen relevante...")
         fallback_image = full_article.get('top_image') if full_article else None
         imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
 
-        # 6. Redactar con Gemini (con todo el contexto triangulado)
+        # 5. Redactar con Gemini (con todo el contexto triangulado)
         try:
             prompt = build_prompt(
                 item,
