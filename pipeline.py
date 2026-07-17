@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.1 - Grounding + Cascada + Fixes)
-=====================================================================================
+Pipeline de automatizacion para tecno.ar (Hybrid 4.2 - Titulos + Antirepeticion)
+===================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las mejores
-3. Triangulacion de fuentes: grounding de Gemini (modelo fijo 2.5-flash, mas
-   estable en rate limit que los preview) como metodo principal; cascada de
-   Custom Search con filtro de relevancia real como respaldo
+3. Triangulacion de fuentes: grounding de Gemini (modelo fijo 2.5-flash) como
+   metodo principal; cascada de Custom Search con filtro de relevancia como respaldo
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
 5. Busqueda de imagen relevante via Google Custom Search API
-6. Redaccion con Gemini usando contenido triangulado (con retry, keyword semantico)
+6. Redaccion con Gemini: titulos con gancho periodistico real, memoria de
+   titulos recientes para evitar formulas repetidas, keyword semantico estricto
 """
 
 import feedparser
@@ -34,21 +34,23 @@ BASE_DIR = Path(__file__).parent
 FEEDS_FILE = BASE_DIR / "feeds.txt"
 SEEN_FILE = BASE_DIR / "seen.json"
 DRAFTS_DIR = BASE_DIR / "drafts"
+TITULOS_RECIENTES_FILE = BASE_DIR / "titulos_recientes.json"
+
+MAX_TITULOS_RECIENTES = 15  # cuantos titulos previos recordar para evitar repeticion
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Modelo usado para redaccion y ranking (configurable).
-GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
 # Modelo FIJO para el grounding de triangulacion. Los modelos -preview
-# (ej: gemini-3-flash-preview) tienen limites de RPM mucho mas bajos y
-# tiran 429 con facilidad en un pipeline que hace varias llamadas seguidas.
-# gemini-2.5-flash es estable y tiene 1.500 solicitudes/dia gratis con
-# grounding incluido, compartido con la cuota general de la API.
+# tienen limites de RPM mucho mas bajos y tiran 429 con facilidad en un
+# pipeline que hace varias llamadas seguidas. gemini-2.5-flash es estable
+# y tiene 1.500 solicitudes/dia gratis con grounding incluido.
 GEMINI_GROUNDING_MODEL = "gemini-2.5-flash"
 GEMINI_GROUNDING_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -69,18 +71,9 @@ MAX_FUENTES_ADICIONALES = 2
 SEARCH_MAX_RETRIES = 2
 SEARCH_BASE_BACKOFF = 3
 
-# Umbral de similitud para considerar que dos noticias del pool de RSS
-# cubren el mismo tema. Se calcula con Jaccard sobre palabras clave.
-SIMILITUD_MINIMA = 0.12
-
-# Umbral de relevancia minima para aceptar un resultado de la cascada de
-# respaldo (Custom Search). Sin sort=date, los resultados ya vienen
-# ordenados por relevancia de Google, pero este filtro extra evita colar
-# resultados de dominios/fecha validos pero tematicamente irrelevantes.
+SIMILITUD_MINIMA = 0.18
 UMBRAL_RELEVANCIA_CASCADA = 0.12
 
-# Sitios especificos donde buscar fuentes relacionadas en la cascada de
-# respaldo (se arma como OR de operadores site: dentro de la query).
 SITIOS_REFERENCIA_BUSQUEDA = [
     "techcrunch.com",
     "theverge.com",
@@ -106,8 +99,6 @@ SITIOS_REFERENCIA_BUSQUEDA = [
     "androidauthority.com",
 ]
 
-# Dominios que no cuentan como "fuente distinta" util al triangular
-# (agregadores, redes sociales; el dominio de origen se excluye dinamicamente).
 DOMINIOS_EXCLUIDOS = {
     "twitter.com", "x.com", "facebook.com", "reddit.com",
     "youtube.com", "tecno.ar", "news.google.com",
@@ -155,6 +146,29 @@ def load_seen():
 def save_seen(seen):
     SEEN_FILE.write_text(json.dumps(seen, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def load_titulos_recientes():
+    if TITULOS_RECIENTES_FILE.exists():
+        try:
+            return json.loads(TITULOS_RECIENTES_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return []
+    return []
+
+def guardar_titulo_reciente(seo_title):
+    if not seo_title:
+        return
+    titulos = load_titulos_recientes()
+    titulos.append(seo_title)
+    titulos = titulos[-MAX_TITULOS_RECIENTES:]
+    TITULOS_RECIENTES_FILE.write_text(
+        json.dumps(titulos, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+def extraer_seo_title(article_md):
+    """Extrae el contenido del campo SEO_TITLE del markdown generado por Gemini."""
+    match = re.search(r"## SEO_TITLE\s*\n(.+?)(?:\n##|\Z)", article_md, re.DOTALL)
+    return match.group(1).strip() if match else None
+
 def item_hash(entry):
     key = entry.get("link") or entry.get("title", "")
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -168,15 +182,10 @@ def slugify(text):
     return re.sub(r"[\s_-]+", "-", text).strip("-")[:60]
 
 def tokenizar(texto):
-    """Extrae palabras clave relevantes de un texto, sacando stopwords y palabras cortas."""
     palabras = re.findall(r"[a-záéíóúñ0-9]+", texto.lower())
     return {p for p in palabras if p not in STOPWORDS_ES and len(p) > 2}
 
 def similitud_texto(a, b):
-    """
-    Calcula similitud entre dos strings (0.0 a 1.0) usando el indice de Jaccard
-    sobre palabras clave.
-    """
     set_a, set_b = tokenizar(a), tokenizar(b)
     if not set_a or not set_b:
         return 0.0
@@ -192,43 +201,45 @@ def _resolver_url_real(url_redirect, timeout=10):
     """
     Las URLs que devuelve el grounding de Gemini a veces son links de
     redireccion de Google (vertexaisearch.cloud.google.com/grounding-api-redirect/...),
-    no la URL real de la fuente. Esta funcion sigue el redirect HTTP y
-    devuelve la URL final real, para usarla en el articulo y para poder
-    extraer el contenido completo despues.
+    no la URL real de la fuente. Sigue el redirect HTTP y devuelve la URL
+    final real. Si no se puede resolver (link expirado/roto), devuelve
+    None explicitamente para que la fuente se descarte en vez de pasar
+    un link roto a la extraccion de contenido.
     """
     if "vertexaisearch.cloud.google.com" not in url_redirect:
-        return url_redirect  # ya es una URL real, no hace falta resolver
+        return url_redirect
 
-    try:
-        resp = requests.head(
-            url_redirect, timeout=timeout, allow_redirects=True,
-            headers=REQUEST_HEADERS,
-        )
-        if resp.url and "vertexaisearch.cloud.google.com" not in resp.url:
-            return resp.url
-    except requests.exceptions.RequestException:
-        pass
+    for metodo in ("head", "get"):
+        try:
+            if metodo == "head":
+                resp = requests.head(
+                    url_redirect, timeout=timeout, allow_redirects=True,
+                    headers=REQUEST_HEADERS,
+                )
+            else:
+                resp = requests.get(
+                    url_redirect, timeout=timeout, allow_redirects=True,
+                    headers=REQUEST_HEADERS, stream=True,
+                )
+                resp.close()
 
-    # Si HEAD falla (algunos servidores no lo soportan bien), probamos con GET
-    try:
-        resp = requests.get(
-            url_redirect, timeout=timeout, allow_redirects=True,
-            headers=REQUEST_HEADERS, stream=True,
-        )
-        resp.close()  # no necesitamos el body, solo la URL final
-        if resp.url and "vertexaisearch.cloud.google.com" not in resp.url:
-            return resp.url
-    except requests.exceptions.RequestException as e:
-        print(f"    ⚠️ No se pudo resolver la URL de redirección: {e}")
+            if resp.status_code >= 400:
+                print(f"    ⚠️ Redirect respondió {resp.status_code} con {metodo.upper()}, "
+                      f"probando otro método...")
+                continue
 
-    return url_redirect  # si todo falla, devolvemos la original (mejor que nada)
+            if resp.url and "vertexaisearch.cloud.google.com" not in resp.url:
+                return resp.url
+
+        except requests.exceptions.RequestException as e:
+            print(f"    ⚠️ Error resolviendo redirect con {metodo.upper()}: {e}")
+            continue
+
+    print("    ⚠️ No se pudo resolver el link de redirección "
+          "(probablemente expiró). Se descarta esta fuente.")
+    return None
 
 def _google_search_con_reintentos(params, contexto=""):
-    """
-    Ejecuta una llamada a Google Custom Search con reintentos ante errores
-    transitorios de red o 5xx. Devuelve la respuesta JSON o None si fallan
-    todos los intentos.
-    """
     for intento in range(SEARCH_MAX_RETRIES + 1):
         try:
             resp = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=15)
@@ -337,12 +348,6 @@ def compute_relevance_score(entry_text):
 # ----------------------------------------------------------------------
 
 def call_gemini_grounding_api(payload, context="grounding", retries=GEMINI_MAX_RETRIES):
-    """
-    Igual que call_gemini_api, pero apunta siempre a GEMINI_GROUNDING_URL
-    (modelo fijo gemini-2.5-flash) en vez de al modelo configurable
-    GEMINI_MODEL, para evitar los limites de RPM mas estrictos de modelos
-    -preview cuando se usan para triangulacion.
-    """
     if not GEMINI_API_KEY:
         raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY")
 
@@ -379,19 +384,6 @@ def call_gemini_grounding_api(payload, context="grounding", retries=GEMINI_MAX_R
     raise RuntimeError(f"Se agotaron los reintentos en {context}: {last_error}")
 
 def buscar_fuentes_con_grounding(item, max_fuentes=MAX_FUENTES_ADICIONALES):
-    """
-    Usa la herramienta de Grounding con Google Search de Gemini (modelo fijo
-    gemini-2.5-flash, ver GEMINI_GROUNDING_MODEL) para que el propio modelo
-    busque en tiempo real fuentes que cubran el mismo tema que el item
-    principal, evaluando semanticamente cuales son relevantes. Gratis hasta
-    1.500 solicitudes/dia, compartido con la cuota general de la API.
-
-    Devuelve:
-    - Una lista (posiblemente vacia) si la llamada funciono correctamente.
-    - None si hubo un fallo tecnico real (para distinguir "no encontro nada"
-      de "la llamada fallo", y asi decidir si conviene caer a la cascada
-      de respaldo).
-    """
     if not GEMINI_API_KEY:
         print("    ⚠️ Sin GEMINI_API_KEY, no se puede usar grounding.")
         return None
@@ -426,7 +418,6 @@ Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
         data = call_gemini_grounding_api(payload, context="grounding-triangulacion")
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
 
-        # Gemini a veces envuelve el JSON en ```json ... ```, lo limpiamos
         raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
         result = json.loads(raw_text)
         fuentes_crudas = result.get("fuentes", [])
@@ -440,9 +431,12 @@ Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
             if not link_original:
                 continue
 
-            # Resolver la URL de redireccion de Google (vertexaisearch...)
-            # a la URL real de la fuente antes de filtrar por dominio.
             link = _resolver_url_real(link_original)
+            if link is None:
+                print(f"    ⏭️ Fuente descartada por link de redirección no resuelto: "
+                      f"{f.get('source', 'desconocido')}")
+                continue
+
             dominio = _extraer_dominio(link)
 
             if not dominio or dominio in dominios_vistos:
@@ -479,11 +473,6 @@ Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
 # ----------------------------------------------------------------------
 
 def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
-    """
-    Busca entre los candidatos de RSS ya descargados una segunda nota que
-    cubra el mismo tema, usando el indice de Jaccard sobre palabras clave.
-    Calculo local, no gasta cuota de ninguna API externa.
-    """
     texto_principal = item_principal["title"] + " " + item_principal["summary"]
     mejor_similitud = 0
     mejor_candidato = None
@@ -509,15 +498,6 @@ def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
     return None
 
 def _ejecutar_busqueda_texto(query, date_restrict, dominio_origen, max_fuentes, titulo_original=""):
-    """
-    Ejecuta una busqueda de texto puntual contra Custom Search y devuelve
-    una lista de fuentes filtradas por dominio Y por relevancia real
-    (Jaccard contra el titulo original). NO usa sort=date, porque ese
-    parametro prioriza la fecha por encima de la relevancia y puede traer
-    resultados recientes pero tematicamente irrelevantes (ver bug detectado
-    con la noticia de iOS 27, donde trajo notas de Waze y de seguridad
-    infantil sin ninguna relacion con el tema real).
-    """
     params = {
         "key": GOOGLE_SEARCH_API_KEY,
         "cx": GOOGLE_SEARCH_ENGINE_ID,
@@ -547,9 +527,6 @@ def _ejecutar_busqueda_texto(query, date_restrict, dominio_origen, max_fuentes, 
         if any(excl in dominio for excl in DOMINIOS_EXCLUIDOS):
             continue
 
-        # Filtro de relevancia real: el resultado tiene que compartir
-        # palabras clave con el titulo original, sino se descarta aunque
-        # el dominio y la fecha sean validos.
         titulo_resultado = r.get("title", "") + " " + r.get("snippet", "")
         if titulo_original:
             sim = similitud_texto(titulo_original, titulo_resultado)
@@ -573,11 +550,6 @@ def _ejecutar_busqueda_texto(query, date_restrict, dominio_origen, max_fuentes, 
     return fuentes
 
 def buscar_fuentes_cascada_respaldo(item, todos_los_candidatos, max_fuentes=MAX_FUENTES_ADICIONALES):
-    """
-    Cascada de respaldo (4 niveles) que se usa SOLO si el grounding de
-    Gemini fallo tecnicamente (devolvio None, no si simplemente no
-    encontro fuentes). Va de mas preciso a mas amplio.
-    """
     if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
         print("    ⚠️ Sin credenciales de Google Search, saltando cascada de respaldo.")
         fuente_rss = encontrar_fuente_secundaria(item, todos_los_candidatos)
@@ -621,11 +593,6 @@ def buscar_fuentes_cascada_respaldo(item, todos_los_candidatos, max_fuentes=MAX_
 # ----------------------------------------------------------------------
 
 def buscar_imagen_google(query, fallback_url=None):
-    """
-    Busca una imagen relacionada con el tema del artículo usando
-    Google Custom Search API. Devuelve la URL de la primera imagen
-    encontrada, o fallback_url si falla.
-    """
     if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
         print("⚠️ Sin credenciales de Google Search, usando imagen de la fuente original.")
         return fallback_url
@@ -1011,16 +978,13 @@ def fetch_new_relevant_items():
     return seleccionados_final, candidatos_para_triangular
 
 # ----------------------------------------------------------------------
-# CONSTRUCCION DEL PROMPT (soporta multiples fuentes adicionales)
+# CONSTRUCCION DEL PROMPT (titulos con gancho real + antirepeticion)
 # ----------------------------------------------------------------------
 
-def build_prompt(item, full_text_principal, fuentes_adicionales=None, imagen_url=None):
-    """
-    fuentes_adicionales: lista de dicts, cada uno con al menos
-    {title, source, link} y opcionalmente {summary, texto_completo}.
-    """
+def build_prompt(item, full_text_principal, fuentes_adicionales=None, imagen_url=None, titulos_recientes=None):
     text_limit = full_text_principal[:6000] if full_text_principal else item['summary']
     fuentes_adicionales = fuentes_adicionales or []
+    titulos_recientes = titulos_recientes or []
 
     bloque_secundario = ""
     for idx, f in enumerate(fuentes_adicionales, 1):
@@ -1060,6 +1024,23 @@ URL: {f['link']}
     fuentes_finales_str = item['source']
     if fuentes_adicionales:
         fuentes_finales_str += " y " + ", ".join(f['source'] for f in fuentes_adicionales)
+
+    bloque_titulos_previos = ""
+    if titulos_recientes:
+        lista_titulos = "\n".join(f"- {t}" for t in titulos_recientes)
+        bloque_titulos_previos = f"""
+===========================================
+TITULOS YA PUBLICADOS RECIENTEMENTE (PROHIBIDO REPETIR SU ESTRUCTURA)
+===========================================
+Estos son los ultimos titulos publicados en tecno.ar. Tu nuevo SEO_TITLE y H1
+NO pueden empezar con la misma formula, palabra de apertura, o estructura
+sintactica que ninguno de estos, aunque el tema de hoy sea completamente
+distinto. Antes de escribir tu titulo final, compara mentalmente sus primeras
+2-3 palabras contra cada uno de estos: si hay coincidencia o un patron muy
+similar, descartalo y reescribi desde cero con un angulo distinto.
+
+{lista_titulos}
+"""
 
     return f"""Actua como un redactor SEO senior especializado en tecnologia,
 con dominio experto de los criterios de puntuacion de Rank Math para WordPress,
@@ -1110,9 +1091,6 @@ de penetracion con Claude Code":
 - BIEN: "T3MP3ST: la herramienta T3MP3ST para pruebas de penetracion con
   Claude Code" (el keyword se inserta una sola vez, sin envolverlo en una
   frase que repita su propio sustantivo)
-- TAMBIEN BIEN: "Asi funciona T3MP3ST, la herramienta T3MP3ST para pruebas
-  de penetracion con Claude Code" (la frase envolvente usa un verbo/adverbio
-  distinto, no repite "herramienta" antes del keyword)
 
 REGLA GENERAL DE ORO: antes de escribir cualquier titulo, H1, o primera
 oracion del cuerpo, identifica la PRIMERA PALABRA SUSTANTIVA del keyword
@@ -1131,16 +1109,13 @@ EJEMPLOS DE KEYWORDS CORRECTOS:
 - "chips de Apple con Broadcom"                     (sustantivo + complementos)
 - "rastreador Moto Tag 2"                           (sustantivo + nombre propio)
 - "demanda por secretos comerciales entre Apple y OpenAI"  (evento como sustantivo)
-- "herramienta T3MP3ST para pruebas de penetracion con Claude Code" (correcto
-  como keyword, PERO requiere cuidado especial al insertarlo, ver Regla Critica #2)
 
 CHECKLIST antes de definir el keyword final (las 4 deben dar SI):
 1. ¿Se puede leer el keyword dentro de una oracion completa sin sonar
    una lista de nombres propios pegados?
 2. ¿Tiene al menos una palabra funcional en español (de, con, para, en, por, entre)?
 3. ¿Es asi como lo diria un periodista en voz alta?
-4. ¿El keyword es un SUSTANTIVO/EVENTO (no una oracion con sujeto+verbo propios),
-   de forma que se pueda insertar como objeto/complemento sin repetir el sujeto?
+4. ¿El keyword es un SUSTANTIVO/EVENTO (no una oracion con sujeto+verbo propios)?
 
 ===========================================
 PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
@@ -1150,17 +1125,59 @@ PASO 2: GENERA TODOS ESTOS CAMPOS (en este orden exacto)
 [el keyword elegido, validado con el checklist de arriba. ESTE STRING EXACTO,
 caracter por caracter, es el que vas a repetir en SEO_TITLE, H1, y en el primer
 parrafo del ARTICULO. No lo conjugues, no le cambies el orden de las palabras,
-no le agregues ni saques articulos. Es un string fijo que se copia y pega igual
-en cada instancia obligatoria.]
+no le agregues ni saques articulos.]
 
 ## SEO_TITLE
-Titulo de 50-60 caracteres. El focus keyword (string identico al de arriba)
-debe aparecer lo mas cerca posible del inicio del titulo.
-ANTES DE ESCRIBIRLO: aplica la Regla Critica #2. Identifica la primera palabra
-sustantiva del keyword y asegurate de que la plantilla del titulo NO la repita
-antes de insertar el keyword. Si el keyword ya es autosuficiente como titulo,
-NO le agregues una frase envolvente generica delante — insertalo directo o
-antecedido por algo especifico de la noticia (un dato, una accion, un "asi").
+===========================================
+COMO ESCRIBIR UN TITULO QUE REALMENTE ATRAIGA AL LECTOR (LO MAS IMPORTANTE)
+===========================================
+El titulo es lo unico que decide si alguien entra a leer la nota o la ignora
+en el feed. Un titulo generico, tibio, o que suena a plantilla es la
+diferencia entre una nota leida y una nota muerta. Escribilo con estos
+principios de periodismo digital real, en este orden de importancia:
+
+1. EMPEZA POR EL HECHO, NO POR UNA INTRODUCCION:
+   El sujeto real de la noticia (la empresa, el producto, la persona) o la
+   accion concreta van PRIMERO. Nunca antepongas una frase de relleno antes
+   del hecho.
+   MAL: "Todo sobre el nuevo lanzamiento de Google para IA"
+   BIEN: "Google lanza una IA que edita fotos con un solo comando de voz"
+
+2. USA UN VERBO FUERTE Y ACTIVO, NUNCA UNO DEBIL O GENERICO:
+   Preferi verbos de accion concreta (lanza, presenta, confirma, revela,
+   bloquea, dispara, rompe, supera, gana, pierde, demanda, ataca, corrige)
+   por sobre verbos vagos (tiene que ver con, esta relacionado a, habla de).
+
+3. INCLUI UN DATO O NUMERO CONCRETO SI LA NOTICIA LO TIENE:
+   Una cifra, un porcentaje, un precio, o un nombre propio ancla el titulo
+   en la realidad y genera mas curiosidad que una descripcion abstracta.
+   MAS DEBIL: "Nueva actualizacion de seguridad para routers"
+   MAS FUERTE: "Cisco corrige una falla critica que exponia routers de medio mundo"
+
+4. GENERA UNA BRECHA DE CURIOSIDAD SIN CAER EN CLICKBAIT ENGAÑOSO:
+   El lector tiene que sentir que falta un dato que solo consigue si entra
+   a leer (el "como", el "por que", el "cuanto"), pero el titulo NUNCA debe
+   prometer algo que el articulo no cumple. Nada de "no vas a creer que...".
+
+5. LARGO Y RITMO:
+   Entre 50 y 60 caracteres. Frases cortas y directas, sin subordinadas
+   largas. Leelo en voz alta: si te trabas o suena a oracion de manual,
+   reescribilo mas corto y directo.
+
+6. EL FOCUS KEYWORD (string identico al definido arriba) tiene que aparecer
+   lo mas cerca posible del inicio del titulo, integrado naturalmente en la
+   frase que ya cumple los puntos 1 a 5 — nunca agregado como un parche al
+   final ni forzado con una plantilla generica.
+
+EJEMPLOS DE ANTES/DESPUES (referencia de calidad esperada):
+- ANTES (generico): "Todo sobre el rebranding de NotebookLM a Gemini Notebook"
+  DESPUES (con gancho real): "Google rebautiza NotebookLM como Gemini Notebook"
+- ANTES (generico): "Todo sobre el modelo Inkling de Thinking Machines"
+  DESPUES (con gancho real): "Thinking Machines lanza Inkling, su primer modelo propio de IA"
+- ANTES (generico): "Todo sobre la consola Codex Micro de OpenAI y su impacto"
+  DESPUES (con gancho real): "OpenAI entra al hardware con la consola Codex Micro"
+
+{bloque_titulos_previos}
 
 ## SLUG
 version-corta-en-minusculas-con-guiones-del-focus-keyword
@@ -1169,12 +1186,14 @@ el slug tambien debe conservarlos como guion (ej: entre-apple-y-openai).
 
 ## META_DESCRIPTION
 Entre 150 y 160 caracteres. Debe incluir el focus keyword (string identico).
-NO usar asteriscos ni markdown de ningun tipo dentro de este campo.
+NO usar asteriscos ni markdown de ningun tipo dentro de este campo. Aplica
+los mismos principios de gancho del SEO_TITLE: hecho concreto + verbo activo,
+no una descripcion generica.
 
 ## H1
 El titulo visible del articulo. Debe incluir el focus keyword (string identico).
-Aplica la MISMA Regla Critica #2 que en el SEO_TITLE: no repitas la primera
-palabra sustantiva del keyword en la frase que lo envuelve.
+Aplica EXACTAMENTE los mismos 6 principios de gancho que el SEO_TITLE (puede
+ser identico al SEO_TITLE o una variacion minima, pero nunca mas generico).
 
 ## ARTICULO
 El cuerpo de la nota en Markdown (600-900 palabras):
@@ -1188,16 +1207,6 @@ El cuerpo de la nota en Markdown (600-900 palabras):
      para que el keyword entre como complemento/objeto.
    - Si (b) es cierto, no repitas esa palabra sustantiva en el texto que
      rodea directamente al keyword.
-   - Ejemplo de integracion CORRECTA con keyword "demanda por secretos
-     comerciales entre Apple y OpenAI":
-     "La tensión entre gigantes tecnológicos escaló esta semana con una
-     [demanda por secretos comerciales entre Apple y OpenAI], presentada
-     ante un tribunal de California."
-   - Ejemplo de integracion INCORRECTA (sujeto duplicado):
-     "Apple ha iniciado una demanda de Apple a OpenAI por secretos..."
-   - Ejemplo de integracion INCORRECTA (sustantivo duplicado):
-     "Existe una nueva herramienta que facilita la [herramienta T3MP3ST
-     para pruebas de penetracion con Claude Code]"
    - El keyword debe aparecer como STRING EXACTO (mismas palabras, mismo
      orden) dentro de una oracion que se lea 100% natural al leerla en voz alta.
    - Releé la oracion completa antes de continuar: si suena repetitiva,
@@ -1208,23 +1217,11 @@ El cuerpo de la nota en Markdown (600-900 palabras):
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
    - AL MENOS UNO de esos subtitulos (idealmente el primero o el segundo)
      debe contener el focus keyword completo, o una VARIACION cercana del
-     mismo (ej: cambiando el orden de las palabras, usando plural/singular,
-     o reemplazando una preposicion por otra equivalente), siempre y cuando
-     el subtitulo se siga leyendo natural, como un titulo real de seccion.
-   - Ejemplo con keyword "herramienta T3MP3ST para pruebas de penetracion
-     con Claude Code":
-     -> H2 correcto: "## Como funciona la herramienta T3MP3ST para pruebas
-        de penetracion"
-     -> H2 correcto (variacion): "## T3MP3ST y las pruebas de penetracion
-        con Claude Code"
-     -> H2 incorrecto: "## Caracteristicas principales" (generico, no
-        menciona el keyword ni ninguna variacion suya)
-   - Los demas H2 (los que no llevan el keyword) pueden ser mas libres y
-     tematicos (ej: antecedentes, riesgos, contexto de la industria), pero
-     igual deben estar relacionados directamente con el tema del articulo.
-   - NUNCA repitas el keyword completo en mas de un H2 (para no sonar
-     repetitivo); si necesitas reforzarlo en otro subtitulo, usa una
-     variacion distinta a la ya usada, no el mismo string dos veces.
+     mismo, siempre y cuando el subtitulo se siga leyendo natural.
+   - Los demas H2 pueden ser mas libres y tematicos (antecedentes, riesgos,
+     contexto de la industria), pero deben estar relacionados directamente
+     con el tema del articulo.
+   - NUNCA repitas el keyword completo en mas de un H2.
 
 3. ESTRUCTURA GENERAL:
    - Parrafos cortos: maximo 3-4 lineas cada uno.
@@ -1237,7 +1234,7 @@ El cuerpo de la nota en Markdown (600-900 palabras):
 
 5. ENLACES:
    - El PRIMER enlace externo va exactamente sobre la mención del focus
-     keyword en el primer párrafo (el mismo lugar del punto 1), asi:
+     keyword en el primer párrafo, asi:
      [{{el string exacto del keyword}}]({item['link']})
    {enlaces_instruccion}
 
@@ -1246,19 +1243,20 @@ VALIDACION FINAL OBLIGATORIA (haceła antes de responder)
 ===========================================
 Antes de entregar la respuesta, verificá vos mismo, CAMPO POR CAMPO:
 1. ¿El FOCUS_KEYWORD es idéntico, carácter por carácter, en SEO_TITLE, H1,
-   y en la primera mención dentro del ARTICULO? Si hay una sola diferencia
-   (singular/plural, orden de palabras, articulo agregado/sacado), corregilo.
-2. En el SEO_TITLE: ¿la primera palabra sustantiva del keyword se repite en
-   la frase que lo envuelve? Si es así, reescribí el título completo.
-3. En el H1: mismo chequeo que el punto 2.
-4. En el ARTICULO: ¿la oración donde aparece el keyword por primera vez
-   repite el mismo sujeto o el mismo sustantivo principal dos veces? Si es
-   así, reescribí la oración completa.
-5. ¿Al menos uno de los subtitulos H2 contiene el keyword completo o una
-   variacion cercana del mismo? Contá los H2 uno por uno y confirmá que no
-   sean todos genéricos sin relación textual con el keyword.
-6. ¿Cada una de estas oraciones/títulos suena como la diría un periodista
-   al leerla en voz alta, sin sonar forzada, robótica, o redundante?
+   y en la primera mención dentro del ARTICULO?
+2. ¿El SEO_TITLE y el H1 arrancan con el HECHO concreto (sujeto+verbo activo),
+   no con una formula generica tipo "Todo sobre..." o similar?
+3. ¿El SEO_TITLE y el H1 evitan repetir la estructura de alguno de los
+   titulos recientes listados arriba (si los hay)?
+4. En el SEO_TITLE y H1: ¿la primera palabra sustantiva del keyword se repite
+   en la frase que lo envuelve? Si es así, reescribí el título completo.
+5. En el ARTICULO: ¿la oración donde aparece el keyword por primera vez
+   repite el mismo sujeto o el mismo sustantivo principal dos veces?
+6. ¿Al menos uno de los subtitulos H2 contiene el keyword completo o una
+   variacion cercana del mismo?
+7. Leé el SEO_TITLE en voz alta: ¿te dan ganas de saber mas, o suena a
+   relleno generico que podria aplicar a cualquier noticia? Si es lo segundo,
+   reescribilo desde cero antes de responder.
 
 ===========================================
 FORMATO DE SALIDA
@@ -1307,8 +1305,7 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.1 (grounding fijo 2.5-flash + cascada con "
-          "filtro de relevancia)...")
+    print("🚀 Iniciando pipeline Hybrid 4.2 (titulos con gancho + antirepeticion)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción/ranking) = {GEMINI_MODEL}")
     print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación) = {GEMINI_GROUNDING_MODEL}")
@@ -1331,7 +1328,6 @@ def main():
         fuentes_adicionales = buscar_fuentes_con_grounding(item)
 
         if fuentes_adicionales is None:
-            # Fallo tecnico real (no "no encontro nada"): cascada de respaldo
             print("🔎 Grounding falló técnicamente, usando cascada de respaldo...")
             fuentes_adicionales = buscar_fuentes_cascada_respaldo(item, todos_los_candidatos)
 
@@ -1357,16 +1353,24 @@ def main():
         fallback_image = full_article.get('top_image') if full_article else None
         imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
 
-        # 5. Redactar con Gemini (con todo el contexto triangulado)
+        # 5. Redactar con Gemini (con todo el contexto triangulado + antirepeticion)
         try:
+            titulos_recientes = load_titulos_recientes()
+
             prompt = build_prompt(
                 item,
                 contenido_principal,
                 fuentes_adicionales=fuentes_adicionales,
                 imagen_url=imagen_url,
+                titulos_recientes=titulos_recientes,
             )
             article = call_gemini(prompt)
             save_draft(item, article, imagen_url=imagen_url)
+
+            seo_title_generado = extraer_seo_title(article)
+            if seo_title_generado:
+                guardar_titulo_reciente(seo_title_generado)
+                print(f"📝 Título registrado en historial: {seo_title_generado}")
 
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
