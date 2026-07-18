@@ -237,7 +237,7 @@ def _resolver_url_real(url_redirect, timeout=10):
 
     print("    ⚠️ No se pudo resolver el link de redirección "
           "(probablemente expiró). Se descarta esta fuente.")
-    return None
+    return url_redirect
 
 def _google_search_con_reintentos(params, contexto=""):
     for intento in range(SEARCH_MAX_RETRIES + 1):
