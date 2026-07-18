@@ -71,7 +71,7 @@ MAX_FUENTES_ADICIONALES = 2
 SEARCH_MAX_RETRIES = 2
 SEARCH_BASE_BACKOFF = 3
 
-SIMILITUD_MINIMA = 0.18
+SIMILITUD_MINIMA = 0.12
 UMBRAL_RELEVANCIA_CASCADA = 0.12
 
 SITIOS_REFERENCIA_BUSQUEDA = [
@@ -607,7 +607,7 @@ def buscar_imagen_google(query, fallback_url=None):
         "searchType": "image",
         "num": 5,
         "imgSize": "large",
-        "imgType": "photo",
+        "imgType": "",
         "safe": "active",
         "fileType": "jpg",
     }
