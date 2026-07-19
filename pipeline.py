@@ -20,6 +20,7 @@ import os
 import re
 import time
 import hashlib
+import random
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -27,60 +28,122 @@ import trafilatura
 from readability import Document
 from bs4 import BeautifulSoup
 
-def scrape_reuters_technology():
-    """Scraper específico para Reuters como fuente principal"""
-    url = "https://www.reuters.com/technology/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    
+def scrape_reuters_technology(max_articles=12):
+    """
+    Scraper reforzado para Reuters Technology.
+    Prioridad: últimas 6-8 horas.
+    """
+    print("🌐 Iniciando scraping reforzado de Reuters Technology...")
+
+    # User Agents reales
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+    ]
+
+    # === INTENTOS DIRECTOS ===
+    for attempt in range(3):
+        headers = {
+            "User-Agent": random.choice(user_agents),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8",
+            "Referer": "https://www.google.com/",
+            "DNT": "1",
+        }
+        try:
+            print(f"   🔄 Intento directo {attempt+1}/3...")
+            response = requests.get("https://www.reuters.com/technology/", 
+                                  headers=headers, timeout=20)
+            
+            if response.status_code == 200:
+                print("   ✅ Conexión directa exitosa")
+                return parse_reuters_html(response.text, max_articles)
+            elif response.status_code == 403:
+                print("   ⛔ Bloqueado (403)")
+                time.sleep(random.uniform(2, 4))
+        except Exception as e:
+            print(f"   ⚠️ Error en intento {attempt+1}: {e}")
+            time.sleep(2)
+
+    # === RESPALDO PRINCIPAL: GOOGLE NEWS (ÚLTIMAS 6 HORAS) ===
+    print("   🔄 Usando Google News - últimas 6 horas...")
     try:
-        print("🌐 Scraping Reuters Technology...")
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
+        rss_url = (
+            "https://news.google.com/rss/search?"
+            "q=site:reuters.com/technology+when:6h&"
+            "hl=es-419&gl=AR&ceid=AR:es"
+        )
         
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Selectores actuales de Reuters
-        articles = soup.select('article')[:12]
-        
+        feed = feedparser.parse(rss_url)
         items = []
-        for article in articles:
-            title_tag = article.find(['h2', 'h3'])
-            if not title_tag:
-                continue
-                
-            title = title_tag.get_text(strip=True)
-            link_tag = title_tag.find('a') or article.find('a')
-            if not link_tag or not link_tag.get('href'):
-                continue
-                
-            link = link_tag['href']
-            if not link.startswith('http'):
-                link = f"https://www.reuters.com{link}"
-            
-            desc_tag = article.find('p')
-            description = desc_tag.get_text(strip=True) if desc_tag else ""
-            
+        
+        for entry in list(feed.entries)[:max_articles]:
+            # Filtro extra de tiempo
+            published = getattr(entry, 'published_parsed', None)
+            if published:
+                pub_date = datetime.fromtimestamp(time.mktime(published), tz=timezone.utc)
+                hours_ago = (datetime.now(timezone.utc) - pub_date).total_seconds() / 3600
+                if hours_ago > 8:  # Máximo 8 horas
+                    continue
+
             item = {
-                "hash": hashlib.sha256(link.encode('utf-8')).hexdigest(),
-                "title": title,
-                "link": link,
-                "summary": description,
+                "hash": hashlib.sha256(entry.link.encode('utf-8')).hexdigest(),
+                "title": entry.title,
+                "link": entry.link,
+                "summary": getattr(entry, 'summary', ''),
                 "source": "Reuters Technology",
-                "published": datetime.now(timezone.utc).isoformat(),
+                "published": getattr(entry, 'published', datetime.now(timezone.utc).isoformat()),
             }
             items.append(item)
         
-        print(f"✓ Reuters Technology: {len(items)} artículos scrapeados")
-        return items
-        
+        if items:
+            print(f"   ✓ Google News (últimas horas): {len(items)} artículos")
+            return items
+        else:
+            print("   ⚠️ No hay noticias muy recientes en Google News.")
+            
     except Exception as e:
-        print(f"❌ Error al scrapear Reuters: {e}")
-        return []
+        print(f"   ⚠️ Error en Google News: {e}")
+
+    print("   ❌ No se pudo obtener contenido reciente de Reuters esta vez.")
+    return []
+
+
+def parse_reuters_html(html, max_articles=12):
+    """Parsea el HTML de Reuters"""
+    soup = BeautifulSoup(html, 'html.parser')
+    articles = soup.select('article')[:max_articles]
+    
+    items = []
+    for article in articles:
+        title_tag = article.find(['h2', 'h3'])
+        if not title_tag:
+            continue
+        title = title_tag.get_text(strip=True)
+        
+        link_tag = title_tag.find('a') or article.find('a')
+        if not link_tag or not link_tag.get('href'):
+            continue
+            
+        link = link_tag['href']
+        if not link.startswith('http'):
+            link = f"https://www.reuters.com{link}"
+        
+        desc_tag = article.find('p')
+        description = desc_tag.get_text(strip=True) if desc_tag else ""
+        
+        item = {
+            "hash": hashlib.sha256(link.encode('utf-8')).hexdigest(),
+            "title": title,
+            "link": link,
+            "summary": description,
+            "source": "Reuters Technology",
+            "published": datetime.now(timezone.utc).isoformat(),
+        }
+        items.append(item)
+    
+    return items
 
 # ----------------------------------------------------------------------
 # CONFIGURACION
