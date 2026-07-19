@@ -26,7 +26,61 @@ from datetime import datetime, timezone
 import trafilatura
 from readability import Document
 from bs4 import BeautifulSoup
-from scrapers.reuters import scrape_reuters_technology
+
+def scrape_reuters_technology():
+    """Scraper específico para Reuters como fuente principal"""
+    url = "https://www.reuters.com/technology/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    
+    try:
+        print("🌐 Scraping Reuters Technology...")
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Selectores actuales de Reuters
+        articles = soup.select('article')[:12]
+        
+        items = []
+        for article in articles:
+            title_tag = article.find(['h2', 'h3'])
+            if not title_tag:
+                continue
+                
+            title = title_tag.get_text(strip=True)
+            link_tag = title_tag.find('a') or article.find('a')
+            if not link_tag or not link_tag.get('href'):
+                continue
+                
+            link = link_tag['href']
+            if not link.startswith('http'):
+                link = f"https://www.reuters.com{link}"
+            
+            desc_tag = article.find('p')
+            description = desc_tag.get_text(strip=True) if desc_tag else ""
+            
+            item = {
+                "hash": hashlib.sha256(link.encode('utf-8')).hexdigest(),
+                "title": title,
+                "link": link,
+                "summary": description,
+                "source": "Reuters Technology",
+                "published": datetime.now(timezone.utc).isoformat(),
+            }
+            items.append(item)
+        
+        print(f"✓ Reuters Technology: {len(items)} artículos scrapeados")
+        return items
+        
+    except Exception as e:
+        print(f"❌ Error al scrapear Reuters: {e}")
+        return []
 
 # ----------------------------------------------------------------------
 # CONFIGURACION
@@ -127,6 +181,7 @@ STOPWORDS_ES = {
 # ----------------------------------------------------------------------
 # UTILIDADES
 # ----------------------------------------------------------------------
+
 
 def load_feeds():
     urls = []
@@ -988,6 +1043,7 @@ def fetch_new_relevant_items():
     candidatos = []
     candidatos_para_triangular = []
 
+    # ====================== FEEDS RSS NORMALES ======================
     for url in load_feeds():
         try:
             feed = feedparser.parse(url)
@@ -1027,28 +1083,57 @@ def fetch_new_relevant_items():
 
             candidatos.append(item_data)
 
-    print(f"📰 Noticias que pasaron el filtro rapido: {len(candidatos)} "
+    # ====================== REUTERS TECHNOLOGY (FUENTE PRINCIPAL) ======================
+    print("🌍 Procesando Reuters Technology como fuente principal...")
+    reuters_items = scrape_reuters_technology()
+
+    for item in reuters_items:
+        h = item["hash"]
+        if h in seen:
+            continue
+
+        # Damos alta prioridad a Reuters
+        item_data = {
+            "hash": h,
+            "title": item["title"],
+            "link": item["link"],
+            "summary": item["summary"],
+            "source": item["source"],
+            "published": item["published"],
+            "score_reglas": 8,                    # Alta puntuación
+            "categoria_reglas": "general",
+        }
+
+        candidatos_para_triangular.append(item_data)
+        candidatos.append(item_data)              # Lo agregamos directamente al pool principal
+
+    # ====================== PROCESAMIENTO FINAL ======================
+    print(f"📰 Noticias que pasaron el filtro rápido: {len(candidatos)} "
           f"(pool de triangulación: {len(candidatos_para_triangular)})")
 
     if not candidatos:
         return [], []
 
+    # Limitamos antes del ranking con Gemini
     if len(candidatos) > 30:
         candidatos.sort(key=lambda x: x["score_reglas"], reverse=True)
         candidatos = candidatos[:30]
         print("🔪 Limitando a 30 para el ranking contextual.")
 
+    # Ranking con Gemini
     if len(candidatos) > MAX_ITEMS_PER_RUN:
         seleccionados_por_ia = rank_with_gemini(candidatos)
     else:
         seleccionados_por_ia = candidatos
 
+    # Selección final con límite por fuente
     seleccionados_final = []
     conteo_por_fuente = {}
 
     for item in seleccionados_por_ia:
         if len(seleccionados_final) >= MAX_ITEMS_PER_RUN:
             break
+
         fuente = item["source"]
         if conteo_por_fuente.get(fuente, 0) >= MAX_POR_FUENTE:
             continue
