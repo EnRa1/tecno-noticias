@@ -28,65 +28,96 @@ import trafilatura
 from readability import Document
 from bs4 import BeautifulSoup
 
+def get_free_proxies():
+    """Obtiene lista de proxies gratuitos automáticamente"""
+    print("🔍 Buscando proxies gratuitos...")
+    proxies = []
+    sources = [
+        "https://www.sslproxies.org/",
+        "https://free-proxy-list.net/",
+        "https://www.us-proxy.org/",
+    ]
+    
+    for url in sources:
+        try:
+            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            rows = soup.select("table tr")
+            
+            for row in rows[1:30]:  # primeras 30 filas
+                cols = row.find_all("td")
+                if len(cols) >= 2:
+                    ip = cols[0].text.strip()
+                    port = cols[1].text.strip()
+                    if ip and port:
+                        proxies.append(f"http://{ip}:{port}")
+        except:
+            continue
+    
+    # Eliminar duplicados
+    proxies = list(dict.fromkeys(proxies))
+    print(f"   Encontrados {len(proxies)} proxies gratuitos")
+    return proxies
+
+
 def scrape_reuters_technology(max_articles=12):
     """
-    Scraper reforzado para Reuters Technology.
-    Prioridad: últimas 6-8 horas.
+    Scraper con FREE PROXY LIST AUTOMÁTICA.
     """
-    print("🌐 Iniciando scraping reforzado de Reuters Technology...")
+    print("🌐 Iniciando scraping con proxies automáticos...")
 
-    # User Agents reales
+    proxies_list = get_free_proxies()
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
     ]
 
-    # === INTENTOS DIRECTOS ===
-    for attempt in range(3):
+    for attempt in range(7):  # Más intentos
+        proxy = random.choice(proxies_list) if proxies_list else None
         headers = {
             "User-Agent": random.choice(user_agents),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8",
+            "Accept-Language": "es-AR,es;q=0.9",
             "Referer": "https://www.google.com/",
-            "DNT": "1",
         }
+
         try:
-            print(f"   🔄 Intento directo {attempt+1}/3...")
-            response = requests.get("https://www.reuters.com/technology/", 
-                                  headers=headers, timeout=20)
-            
+            print(f"   🔄 Intento {attempt+1}/7 | Proxy: {'Sí' if proxy else 'No'}")
+
+            if proxy:
+                response = requests.get(
+                    "https://www.reuters.com/technology/", 
+                    headers=headers,
+                    proxies={"http": proxy, "https": proxy},
+                    timeout=20
+                )
+            else:
+                response = requests.get(
+                    "https://www.reuters.com/technology/", 
+                    headers=headers,
+                    timeout=18
+                )
+
             if response.status_code == 200:
-                print("   ✅ Conexión directa exitosa")
+                print("   ✅ ¡Conexión exitosa con proxy!")
                 return parse_reuters_html(response.text, max_articles)
             elif response.status_code == 403:
-                print("   ⛔ Bloqueado (403)")
-                time.sleep(random.uniform(2, 4))
-        except Exception as e:
-            print(f"   ⚠️ Error en intento {attempt+1}: {e}")
-            time.sleep(2)
+                print("   ⛔ Bloqueado - probando otro proxy")
+                time.sleep(random.uniform(2.5, 6))
+                continue
 
-    # === RESPALDO PRINCIPAL: GOOGLE NEWS (ÚLTIMAS 6 HORAS) ===
-    print("   🔄 Usando Google News - últimas 6 horas...")
+        except Exception as e:
+            print(f"   ⚠️ Error con proxy: {e}")
+            time.sleep(random.uniform(1.5, 4))
+
+    # Respaldo Google News (últimas 4 horas)
+    print("   🔄 Respaldo Google News (últimas 4h)...")
     try:
-        rss_url = (
-            "https://news.google.com/rss/search?"
-            "q=site:reuters.com/technology+when:6h&"
-            "hl=es-419&gl=AR&ceid=AR:es"
-        )
-        
+        rss_url = "https://news.google.com/rss/search?q=site:reuters.com/technology+when:4h&hl=es-419&gl=AR&ceid=AR:es"
         feed = feedparser.parse(rss_url)
         items = []
-        
         for entry in list(feed.entries)[:max_articles]:
-            # Filtro extra de tiempo
-            published = getattr(entry, 'published_parsed', None)
-            if published:
-                pub_date = datetime.fromtimestamp(time.mktime(published), tz=timezone.utc)
-                hours_ago = (datetime.now(timezone.utc) - pub_date).total_seconds() / 3600
-                if hours_ago > 8:  # Máximo 8 horas
-                    continue
-
             item = {
                 "hash": hashlib.sha256(entry.link.encode('utf-8')).hexdigest(),
                 "title": entry.title,
@@ -96,24 +127,20 @@ def scrape_reuters_technology(max_articles=12):
                 "published": getattr(entry, 'published', datetime.now(timezone.utc).isoformat()),
             }
             items.append(item)
-        
         if items:
-            print(f"   ✓ Google News (últimas horas): {len(items)} artículos")
+            print(f"   ✅ Google News: {len(items)} artículos recientes")
             return items
-        else:
-            print("   ⚠️ No hay noticias muy recientes en Google News.")
-            
     except Exception as e:
-        print(f"   ⚠️ Error en Google News: {e}")
+        print(f"   ⚠️ Error Google News: {e}")
 
-    print("   ❌ No se pudo obtener contenido reciente de Reuters esta vez.")
+    print("   ❌ No se pudo obtener contenido esta vez.")
     return []
 
 
 def parse_reuters_html(html, max_articles=12):
-    """Parsea el HTML de Reuters"""
+    """Parser del HTML"""
     soup = BeautifulSoup(html, 'html.parser')
-    articles = soup.select('article')[:max_articles]
+    articles = soup.select('article, div[class*="story"]')[:max_articles]
     
     items = []
     for article in articles:
@@ -121,7 +148,9 @@ def parse_reuters_html(html, max_articles=12):
         if not title_tag:
             continue
         title = title_tag.get_text(strip=True)
-        
+        if len(title) < 15:
+            continue
+            
         link_tag = title_tag.find('a') or article.find('a')
         if not link_tag or not link_tag.get('href'):
             continue
@@ -130,8 +159,8 @@ def parse_reuters_html(html, max_articles=12):
         if not link.startswith('http'):
             link = f"https://www.reuters.com{link}"
         
-        desc_tag = article.find('p')
-        description = desc_tag.get_text(strip=True) if desc_tag else ""
+        desc = article.find('p')
+        description = desc.get_text(strip=True) if desc else ""
         
         item = {
             "hash": hashlib.sha256(link.encode('utf-8')).hexdigest(),
@@ -144,7 +173,6 @@ def parse_reuters_html(html, max_articles=12):
         items.append(item)
     
     return items
-
 # ----------------------------------------------------------------------
 # CONFIGURACION
 # ----------------------------------------------------------------------
