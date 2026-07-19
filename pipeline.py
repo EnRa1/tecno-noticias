@@ -60,61 +60,48 @@ def get_free_proxies():
     return proxies
 
 
-def scrape_reuters_technology(max_articles=12):
-    """
-    Scraper con FREE PROXY LIST AUTOMÁTICA.
-    """
-    print("🌐 Iniciando scraping con proxies automáticos...")
+def scrape_reuters_technology(max_articles=15):
+    print("🌐 Iniciando scraping con proxy exitoso...")
 
-    proxies_list = get_free_proxies()
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
     ]
 
-    for attempt in range(7):  # Más intentos
-        proxy = random.choice(proxies_list) if proxies_list else None
-        headers = {
-            "User-Agent": random.choice(user_agents),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-AR,es;q=0.9",
-            "Referer": "https://www.google.com/",
-        }
+    headers = {
+        "User-Agent": random.choice(user_agents),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-AR,es;q=0.9",
+    }
 
-        try:
-            print(f"   🔄 Intento {attempt+1}/7 | Proxy: {'Sí' if proxy else 'No'}")
-
-            if proxy:
-                response = requests.get(
-                    "https://www.reuters.com/technology/", 
-                    headers=headers,
-                    proxies={"http": proxy, "https": proxy},
-                    timeout=20
-                )
-            else:
-                response = requests.get(
-                    "https://www.reuters.com/technology/", 
-                    headers=headers,
-                    timeout=18
-                )
-
-            if response.status_code == 200:
-                print("   ✅ ¡Conexión exitosa con proxy!")
-                return parse_reuters_html(response.text, max_articles)
-            elif response.status_code == 403:
-                print("   ⛔ Bloqueado - probando otro proxy")
-                time.sleep(random.uniform(2.5, 6))
-                continue
-
-        except Exception as e:
-            print(f"   ⚠️ Error con proxy: {e}")
-            time.sleep(random.uniform(1.5, 4))
-
-    # Respaldo Google News (últimas 4 horas)
-    print("   🔄 Respaldo Google News (últimas 4h)...")
     try:
-        rss_url = "https://news.google.com/rss/search?q=site:reuters.com/technology+when:4h&hl=es-419&gl=AR&ceid=AR:es"
+        # Usamos proxy que funcionó antes
+        proxy = "http://12.50.107.221:80"   # ejemplo del que te funcionó antes
+        print(f"   Usando proxy exitoso: {proxy}")
+
+        response = requests.get(
+            "https://www.reuters.com/technology/", 
+            headers=headers,
+            proxies={"http": proxy, "https": proxy},
+            timeout=25
+        )
+
+        print(f"   Código HTTP: {response.status_code}")
+        
+        if response.status_code == 200:
+            print("   ✅ Conexión exitosa. Parseando contenido...")
+            items = parse_reuters_html_improved(response.text, max_articles)
+            print(f"   📊 Artículos encontrados: {len(items)}")
+            return items
+        else:
+            print(f"   ❌ HTTP {response.status_code}")
+
+    except Exception as e:
+        print(f"   ❌ Error: {e}")
+
+    # Respaldo Google News
+    print("   🔄 Respaldo Google News (últimas 6h)...")
+    try:
+        rss_url = "https://news.google.com/rss/search?q=site:reuters.com/technology+when:6h&hl=es-419&gl=AR&ceid=AR:es"
         feed = feedparser.parse(rss_url)
         items = []
         for entry in list(feed.entries)[:max_articles]:
@@ -128,50 +115,65 @@ def scrape_reuters_technology(max_articles=12):
             }
             items.append(item)
         if items:
-            print(f"   ✅ Google News: {len(items)} artículos recientes")
+            print(f"   ✅ Google News: {len(items)} artículos")
             return items
     except Exception as e:
-        print(f"   ⚠️ Error Google News: {e}")
+        print(f"   Error Google News: {e}")
 
-    print("   ❌ No se pudo obtener contenido esta vez.")
     return []
 
 
-def parse_reuters_html(html, max_articles=12):
-    """Parser del HTML"""
+def parse_reuters_html_improved(html, max_articles=15):
+    """Parser mejorado"""
     soup = BeautifulSoup(html, 'html.parser')
-    articles = soup.select('article, div[class*="story"]')[:max_articles]
+    
+    # Selectores más amplios
+    selectors = [
+        'article',
+        'div[data-testid*="story-card"]',
+        'div[class*="story"]',
+        'div[class*="card"]'
+    ]
     
     items = []
-    for article in articles:
-        title_tag = article.find(['h2', 'h3'])
-        if not title_tag:
-            continue
-        title = title_tag.get_text(strip=True)
-        if len(title) < 15:
-            continue
-            
-        link_tag = title_tag.find('a') or article.find('a')
-        if not link_tag or not link_tag.get('href'):
-            continue
-            
-        link = link_tag['href']
-        if not link.startswith('http'):
-            link = f"https://www.reuters.com{link}"
+    for selector in selectors:
+        articles = soup.select(selector)[:max_articles]
+        print(f"   Selector '{selector}' encontró {len(articles)} elementos")
         
-        desc = article.find('p')
-        description = desc.get_text(strip=True) if desc else ""
-        
-        item = {
-            "hash": hashlib.sha256(link.encode('utf-8')).hexdigest(),
-            "title": title,
-            "link": link,
-            "summary": description,
-            "source": "Reuters Technology",
-            "published": datetime.now(timezone.utc).isoformat(),
-        }
-        items.append(item)
-    
+        for article in articles:
+            title_tag = article.find(['h1', 'h2', 'h3'])
+            if not title_tag:
+                continue
+            title = title_tag.get_text(strip=True)
+            if len(title) < 20:
+                continue
+                
+            link_tag = title_tag.find('a') or article.find('a')
+            if not link_tag or not link_tag.get('href'):
+                continue
+                
+            link = link_tag['href']
+            if not link.startswith('http'):
+                link = f"https://www.reuters.com{link}"
+            
+            desc = article.find('p')
+            description = desc.get_text(strip=True) if desc else ""
+            
+            item = {
+                "hash": hashlib.sha256(link.encode('utf-8')).hexdigest(),
+                "title": title,
+                "link": link,
+                "summary": description,
+                "source": "Reuters Technology",
+                "published": datetime.now(timezone.utc).isoformat(),
+            }
+            items.append(item)
+            
+            if len(items) >= max_articles:
+                break
+        if len(items) >= max_articles:
+            break
+
     return items
 # ----------------------------------------------------------------------
 # CONFIGURACION
