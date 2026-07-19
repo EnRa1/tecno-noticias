@@ -237,7 +237,7 @@ def _resolver_url_real(url_redirect, timeout=10):
 
     print("    ⚠️ No se pudo resolver el link de redirección "
           "(probablemente expiró). Se descarta esta fuente.")
-    return None
+    return url_redirect
 
 def _google_search_con_reintentos(params, contexto=""):
     for intento in range(SEARCH_MAX_RETRIES + 1):
@@ -694,7 +694,7 @@ def buscar_imagen_google(query, fallback_url=None):
         "searchType": "image",
         "num": 5,
         "imgSize": "large",
-        "imgType": "photo",
+        "imgType": "",
         "safe": "active",
         "fileType": "jpg",
     }
@@ -1305,7 +1305,7 @@ El cuerpo de la nota en Markdown (600-900 palabras):
 
 5. ENLACES:
    - El PRIMER enlace externo va exactamente sobre la mención del focus
-     keyword en el primer párrafo, asi:
+     keyword en los párrafos finales, asi:
      [{{el string exacto del keyword}}]({item['link']})
    {enlaces_instruccion}
 
