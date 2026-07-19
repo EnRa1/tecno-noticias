@@ -20,7 +20,6 @@ import os
 import re
 import time
 import hashlib
-import random
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -28,153 +27,6 @@ import trafilatura
 from readability import Document
 from bs4 import BeautifulSoup
 
-def get_free_proxies():
-    """Obtiene lista de proxies gratuitos automáticamente"""
-    print("🔍 Buscando proxies gratuitos...")
-    proxies = []
-    sources = [
-        "https://www.sslproxies.org/",
-        "https://free-proxy-list.net/",
-        "https://www.us-proxy.org/",
-    ]
-    
-    for url in sources:
-        try:
-            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            rows = soup.select("table tr")
-            
-            for row in rows[1:30]:  # primeras 30 filas
-                cols = row.find_all("td")
-                if len(cols) >= 2:
-                    ip = cols[0].text.strip()
-                    port = cols[1].text.strip()
-                    if ip and port:
-                        proxies.append(f"http://{ip}:{port}")
-        except:
-            continue
-    
-    # Eliminar duplicados
-    proxies = list(dict.fromkeys(proxies))
-    print(f"   Encontrados {len(proxies)} proxies gratuitos")
-    return proxies
-
-
-def scrape_reuters_technology(max_articles=15):
-    print("🌐 Iniciando scraping con proxy exitoso...")
-
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    ]
-
-    headers = {
-        "User-Agent": random.choice(user_agents),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "es-AR,es;q=0.9",
-    }
-
-    try:
-        # Usamos proxy que funcionó antes
-        proxy = "http://12.50.107.221:80"   # ejemplo del que te funcionó antes
-        print(f"   Usando proxy exitoso: {proxy}")
-
-        response = requests.get(
-            "https://www.reuters.com/technology/", 
-            headers=headers,
-            proxies={"http": proxy, "https": proxy},
-            timeout=25
-        )
-
-        print(f"   Código HTTP: {response.status_code}")
-        
-        if response.status_code == 200:
-            print("   ✅ Conexión exitosa. Parseando contenido...")
-            items = parse_reuters_html_improved(response.text, max_articles)
-            print(f"   📊 Artículos encontrados: {len(items)}")
-            return items
-        else:
-            print(f"   ❌ HTTP {response.status_code}")
-
-    except Exception as e:
-        print(f"   ❌ Error: {e}")
-
-    # Respaldo Google News
-    print("   🔄 Respaldo Google News (últimas 6h)...")
-    try:
-        rss_url = "https://news.google.com/rss/search?q=site:reuters.com/technology+when:6h&hl=es-419&gl=AR&ceid=AR:es"
-        feed = feedparser.parse(rss_url)
-        items = []
-        for entry in list(feed.entries)[:max_articles]:
-            item = {
-                "hash": hashlib.sha256(entry.link.encode('utf-8')).hexdigest(),
-                "title": entry.title,
-                "link": entry.link,
-                "summary": getattr(entry, 'summary', ''),
-                "source": "Reuters Technology",
-                "published": getattr(entry, 'published', datetime.now(timezone.utc).isoformat()),
-            }
-            items.append(item)
-        if items:
-            print(f"   ✅ Google News: {len(items)} artículos")
-            return items
-    except Exception as e:
-        print(f"   Error Google News: {e}")
-
-    return []
-
-
-def parse_reuters_html_improved(html, max_articles=15):
-    """Parser mejorado"""
-    soup = BeautifulSoup(html, 'html.parser')
-    
-    # Selectores más amplios
-    selectors = [
-        'article',
-        'div[data-testid*="story-card"]',
-        'div[class*="story"]',
-        'div[class*="card"]'
-    ]
-    
-    items = []
-    for selector in selectors:
-        articles = soup.select(selector)[:max_articles]
-        print(f"   Selector '{selector}' encontró {len(articles)} elementos")
-        
-        for article in articles:
-            title_tag = article.find(['h1', 'h2', 'h3'])
-            if not title_tag:
-                continue
-            title = title_tag.get_text(strip=True)
-            if len(title) < 20:
-                continue
-                
-            link_tag = title_tag.find('a') or article.find('a')
-            if not link_tag or not link_tag.get('href'):
-                continue
-                
-            link = link_tag['href']
-            if not link.startswith('http'):
-                link = f"https://www.reuters.com{link}"
-            
-            desc = article.find('p')
-            description = desc.get_text(strip=True) if desc else ""
-            
-            item = {
-                "hash": hashlib.sha256(link.encode('utf-8')).hexdigest(),
-                "title": title,
-                "link": link,
-                "summary": description,
-                "source": "Reuters Technology",
-                "published": datetime.now(timezone.utc).isoformat(),
-            }
-            items.append(item)
-            
-            if len(items) >= max_articles:
-                break
-        if len(items) >= max_articles:
-            break
-
-    return items
 # ----------------------------------------------------------------------
 # CONFIGURACION
 # ----------------------------------------------------------------------
@@ -235,6 +87,7 @@ SITIOS_REFERENCIA_BUSQUEDA = [
     "blog.google",
     "news.microsoft.com",
     "openai.com",
+    "reuters.com"
     "anthropic.com",
     "thehackernews.com",
     "bleepingcomputer.com",
@@ -274,7 +127,6 @@ STOPWORDS_ES = {
 # ----------------------------------------------------------------------
 # UTILIDADES
 # ----------------------------------------------------------------------
-
 
 def load_feeds():
     urls = []
@@ -1136,7 +988,6 @@ def fetch_new_relevant_items():
     candidatos = []
     candidatos_para_triangular = []
 
-    # ====================== FEEDS RSS NORMALES ======================
     for url in load_feeds():
         try:
             feed = feedparser.parse(url)
@@ -1176,57 +1027,28 @@ def fetch_new_relevant_items():
 
             candidatos.append(item_data)
 
-    # ====================== REUTERS TECHNOLOGY (FUENTE PRINCIPAL) ======================
-    print("🌍 Procesando Reuters Technology como fuente principal...")
-    reuters_items = scrape_reuters_technology()
-
-    for item in reuters_items:
-        h = item["hash"]
-        if h in seen:
-            continue
-
-        # Damos alta prioridad a Reuters
-        item_data = {
-            "hash": h,
-            "title": item["title"],
-            "link": item["link"],
-            "summary": item["summary"],
-            "source": item["source"],
-            "published": item["published"],
-            "score_reglas": 8,                    # Alta puntuación
-            "categoria_reglas": "general",
-        }
-
-        candidatos_para_triangular.append(item_data)
-        candidatos.append(item_data)              # Lo agregamos directamente al pool principal
-
-    # ====================== PROCESAMIENTO FINAL ======================
-    print(f"📰 Noticias que pasaron el filtro rápido: {len(candidatos)} "
+    print(f"📰 Noticias que pasaron el filtro rapido: {len(candidatos)} "
           f"(pool de triangulación: {len(candidatos_para_triangular)})")
 
     if not candidatos:
         return [], []
 
-    # Limitamos antes del ranking con Gemini
     if len(candidatos) > 30:
         candidatos.sort(key=lambda x: x["score_reglas"], reverse=True)
         candidatos = candidatos[:30]
         print("🔪 Limitando a 30 para el ranking contextual.")
 
-    # Ranking con Gemini
     if len(candidatos) > MAX_ITEMS_PER_RUN:
         seleccionados_por_ia = rank_with_gemini(candidatos)
     else:
         seleccionados_por_ia = candidatos
 
-    # Selección final con límite por fuente
     seleccionados_final = []
     conteo_por_fuente = {}
 
     for item in seleccionados_por_ia:
         if len(seleccionados_final) >= MAX_ITEMS_PER_RUN:
             break
-
         fuente = item["source"]
         if conteo_por_fuente.get(fuente, 0) >= MAX_POR_FUENTE:
             continue
@@ -1484,7 +1306,7 @@ El cuerpo de la nota en Markdown (600-900 palabras):
 
 5. ENLACES:
    - El PRIMER enlace externo va exactamente sobre la mención del focus
-     keyword en los párrafos finales, asi:
+     keyword en el primer párrafo, asi:
      [{{el string exacto del keyword}}]({item['link']})
    {enlaces_instruccion}
 
