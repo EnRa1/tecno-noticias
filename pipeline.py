@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.2 - Titulos + Antirepeticion)
-===================================================================================
+Pipeline de automatizacion para tecno.ar (Hybrid 4.3 - Validacion Programatica)
+==================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las mejores
 3. Triangulacion de fuentes: grounding de Gemini (modelo fijo 2.5-flash) como
    metodo principal; cascada de Custom Search con filtro de relevancia como respaldo
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
 5. Busqueda de imagen relevante via Google Custom Search API
-6. Redaccion con Gemini: titulos con gancho periodistico real, memoria de
-   titulos recientes para evitar formulas repetidas, keyword semantico estricto
+6. Redaccion con Gemini + VALIDACION PROGRAMATICA (no depende de autoevaluacion
+   del modelo): detecta repeticion de palabras en titulo/H1 en Python puro y
+   pide correccion especifica con reintentos si encuentra problemas
 """
 
 import feedparser
@@ -36,21 +37,17 @@ SEEN_FILE = BASE_DIR / "seen.json"
 DRAFTS_DIR = BASE_DIR / "drafts"
 TITULOS_RECIENTES_FILE = BASE_DIR / "titulos_recientes.json"
 
-MAX_TITULOS_RECIENTES = 15  # cuantos titulos previos recordar para evitar repeticion
+MAX_TITULOS_RECIENTES = 15
+MAX_REINTENTOS_TITULO = 2
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Modelo usado para redaccion y ranking (configurable).
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
-# Modelo FIJO para el grounding de triangulacion. Los modelos -preview
-# tienen limites de RPM mucho mas bajos y tiran 429 con facilidad en un
-# pipeline que hace varias llamadas seguidas. gemini-2.5-flash es estable
-# y tiene 1.500 solicitudes/dia gratis con grounding incluido.
 GEMINI_GROUNDING_MODEL = "gemini-2.5-flash"
 GEMINI_GROUNDING_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -71,7 +68,7 @@ MAX_FUENTES_ADICIONALES = 2
 SEARCH_MAX_RETRIES = 2
 SEARCH_BASE_BACKOFF = 3
 
-SIMILITUD_MINIMA = 0.12
+SIMILITUD_MINIMA = 0.18
 UMBRAL_RELEVANCIA_CASCADA = 0.12
 
 SITIOS_REFERENCIA_BUSQUEDA = [
@@ -164,10 +161,15 @@ def guardar_titulo_reciente(seo_title):
         json.dumps(titulos, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-def extraer_seo_title(article_md):
-    """Extrae el contenido del campo SEO_TITLE del markdown generado por Gemini."""
-    match = re.search(r"## SEO_TITLE\s*\n(.+?)(?:\n##|\Z)", article_md, re.DOTALL)
+def extraer_campo(article_md, nombre_campo):
+    """Extrae el contenido de un campo '## NOMBRE_CAMPO' del markdown generado."""
+    match = re.search(
+        rf"## {nombre_campo}\s*\n(.+?)(?:\n##|\Z)", article_md, re.DOTALL
+    )
     return match.group(1).strip() if match else None
+
+def extraer_seo_title(article_md):
+    return extraer_campo(article_md, "SEO_TITLE")
 
 def item_hash(entry):
     key = entry.get("link") or entry.get("title", "")
@@ -200,11 +202,9 @@ def _extraer_dominio(url):
 def _resolver_url_real(url_redirect, timeout=10):
     """
     Las URLs que devuelve el grounding de Gemini a veces son links de
-    redireccion de Google (vertexaisearch.cloud.google.com/grounding-api-redirect/...),
-    no la URL real de la fuente. Sigue el redirect HTTP y devuelve la URL
-    final real. Si no se puede resolver (link expirado/roto), devuelve
-    None explicitamente para que la fuente se descarte en vez de pasar
-    un link roto a la extraccion de contenido.
+    redireccion de Google (vertexaisearch.cloud.google.com/grounding-api-redirect/...).
+    Sigue el redirect HTTP y devuelve la URL final real. Si no se puede
+    resolver, devuelve None para que la fuente se descarte.
     """
     if "vertexaisearch.cloud.google.com" not in url_redirect:
         return url_redirect
@@ -237,7 +237,7 @@ def _resolver_url_real(url_redirect, timeout=10):
 
     print("    ⚠️ No se pudo resolver el link de redirección "
           "(probablemente expiró). Se descarta esta fuente.")
-    return url_redirect
+    return None
 
 def _google_search_con_reintentos(params, contexto=""):
     for intento in range(SEARCH_MAX_RETRIES + 1):
@@ -265,6 +265,93 @@ def _google_search_con_reintentos(params, contexto=""):
             print(f"    ⚠️ Excepción de red agotó reintentos en {contexto}: {e}")
             return None
     return None
+
+# ----------------------------------------------------------------------
+# VALIDACION PROGRAMATICA DE TITULOS (determinista, no depende de la IA)
+# ----------------------------------------------------------------------
+
+def detectar_repeticion_titulo(titulo, focus_keyword):
+    """
+    Detecta programaticamente si un titulo (SEO_TITLE o H1) repite una
+    palabra significativa del focus_keyword FUERA de la insercion del
+    keyword en si. Esto es lo que falla cuando el modelo genera cosas como:
+    - "Google activa el easter egg de Google por..." (keyword ya contenia "Google")
+    - "Open Notebook: la herramienta Open Notebook de IA local" (keyword
+      ya contenia "Open Notebook" y se repite en la plantilla envolvente)
+
+    Metodo: ubica la posicion del keyword dentro del titulo, lo remueve,
+    y chequea si alguna palabra significativa (no stopword, longitud > 3)
+    del keyword aparece tambien en el resto del titulo.
+
+    Devuelve una lista de palabras repetidas (vacia si no hay problema).
+    """
+    titulo_lower = titulo.lower()
+    keyword_lower = focus_keyword.lower()
+
+    idx = titulo_lower.find(keyword_lower)
+    if idx == -1:
+        # El keyword ni siquiera aparece exacto; ese error lo maneja
+        # validar_campos_generados por separado.
+        return []
+
+    resto_titulo = titulo_lower[:idx] + titulo_lower[idx + len(keyword_lower):]
+
+    palabras_keyword = re.findall(r"[a-záéíóúñ]+", keyword_lower)
+    palabras_resto = set(re.findall(r"[a-záéíóúñ]+", resto_titulo))
+
+    repetidas = []
+    for palabra in palabras_keyword:
+        if palabra in STOPWORDS_ES or len(palabra) <= 3:
+            continue
+        if palabra in palabras_resto:
+            repetidas.append(palabra)
+
+    return repetidas
+
+def validar_campos_generados(article_md):
+    """
+    Valida programaticamente el articulo generado por Gemini. Devuelve una
+    lista de strings describiendo cada problema encontrado (vacia si todo
+    esta OK). No depende de que el modelo se autoevalue; es un chequeo
+    determinista en Python que corre siempre despues de cada generacion.
+    """
+    problemas = []
+
+    focus_keyword = extraer_campo(article_md, "FOCUS_KEYWORD")
+    seo_title = extraer_campo(article_md, "SEO_TITLE")
+    h1 = extraer_campo(article_md, "H1")
+
+    if not focus_keyword or not seo_title or not h1:
+        problemas.append("No se pudo extraer FOCUS_KEYWORD, SEO_TITLE o H1 del markdown.")
+        return problemas
+
+    if focus_keyword.lower() not in seo_title.lower():
+        problemas.append(
+            f'El FOCUS_KEYWORD ("{focus_keyword}") no aparece de forma '
+            f'identica dentro del SEO_TITLE ("{seo_title}").'
+        )
+
+    if focus_keyword.lower() not in h1.lower():
+        problemas.append(
+            f'El FOCUS_KEYWORD ("{focus_keyword}") no aparece de forma '
+            f'identica dentro del H1 ("{h1}").'
+        )
+
+    rep_title = detectar_repeticion_titulo(seo_title, focus_keyword)
+    if rep_title:
+        problemas.append(
+            f'El SEO_TITLE ("{seo_title}") repite la(s) palabra(s) '
+            f'{rep_title} del keyword fuera de su unica insercion valida.'
+        )
+
+    rep_h1 = detectar_repeticion_titulo(h1, focus_keyword)
+    if rep_h1:
+        problemas.append(
+            f'El H1 ("{h1}") repite la(s) palabra(s) {rep_h1} del keyword '
+            f'fuera de su unica insercion valida.'
+        )
+
+    return problemas
 
 # ----------------------------------------------------------------------
 # FILTRO POR FECHA
@@ -607,7 +694,7 @@ def buscar_imagen_google(query, fallback_url=None):
         "searchType": "image",
         "num": 5,
         "imgSize": "large",
-        "imgType": "",
+        "imgType": "photo",
         "safe": "active",
         "fileType": "jpg",
     }
@@ -1035,9 +1122,7 @@ TITULOS YA PUBLICADOS RECIENTEMENTE (PROHIBIDO REPETIR SU ESTRUCTURA)
 Estos son los ultimos titulos publicados en tecno.ar. Tu nuevo SEO_TITLE y H1
 NO pueden empezar con la misma formula, palabra de apertura, o estructura
 sintactica que ninguno de estos, aunque el tema de hoy sea completamente
-distinto. Antes de escribir tu titulo final, compara mentalmente sus primeras
-2-3 palabras contra cada uno de estos: si hay coincidencia o un patron muy
-similar, descartalo y reescribi desde cero con un angulo distinto.
+distinto.
 
 {lista_titulos}
 """
@@ -1079,35 +1164,35 @@ es un ERROR GRAVE: el sujeto "Apple" aparece dos veces.
 
 REGLA CRITICA #2 - EL KEYWORD NO PUEDE CONTENER YA LA PALABRA QUE VAS A
 USAR COMO SUSTANTIVO PRINCIPAL DE UN TITULO O FRASE ENVOLVENTE:
-Muchos keywords empiezan con un sustantivo generico (herramienta, funcion,
-modelo, chip, app, actualizacion, servicio). Si armas un titulo o una
-oracion que envuelve al keyword con una plantilla generica que repite ese
-MISMO sustantivo generico, se genera una redundancia de palabra (no solo
-de sujeto). Por ejemplo, con el keyword "herramienta T3MP3ST para pruebas
-de penetracion con Claude Code":
-- MAL: "T3MP3ST: la herramienta que facilita la herramienta T3MP3ST para..."
-  (la palabra "herramienta" aparece dos veces, una en la plantilla del titulo
+Muchos keywords empiezan con un sustantivo generico o un nombre propio
+(herramienta, funcion, modelo, chip, app, Google, OpenAI). Si armas un
+titulo o una oracion que envuelve al keyword repitiendo esa MISMA palabra,
+se genera una redundancia. Por ejemplo, con el keyword "easter egg de
+Google por Marc Cucurella":
+- MAL: "Google activa el easter egg de Google por Marc Cucurella..."
+  (la palabra "Google" aparece dos veces: una en la plantilla del titulo
   y otra ya incluida dentro del keyword)
-- BIEN: "T3MP3ST: la herramienta T3MP3ST para pruebas de penetracion con
-  Claude Code" (el keyword se inserta una sola vez, sin envolverlo en una
-  frase que repita su propio sustantivo)
+- BIEN: "Un buscador secreto homenajea a Marc Cucurella en pleno Mundial"
+  (el keyword se inserta como parte natural de una oracion nueva, sin
+  repetir "Google" fuera de la insercion del keyword)
+Otro ejemplo, con el keyword "herramienta Open Notebook de IA local":
+- MAL: "Open Notebook: la herramienta Open Notebook de IA local..."
+- BIEN: "Esta herramienta de IA local procesa tus datos sin salir de tu PC"
 
 REGLA GENERAL DE ORO: antes de escribir cualquier titulo, H1, o primera
-oracion del cuerpo, identifica la PRIMERA PALABRA SUSTANTIVA del keyword
-(ej: "herramienta", "demanda", "modelo", "chip"). Esa palabra NO puede
-volver a aparecer en la frase envolvente que rodea al keyword, salvo que el
-keyword se inserte una unica vez sin ningun envoltorio adicional.
+oracion del cuerpo, identifica CADA PALABRA SIGNIFICATIVA del keyword
+(nombres propios, sustantivos principales). Ninguna de esas palabras puede
+volver a aparecer en la frase envolvente que rodea al keyword, salvo que
+el keyword se inserte una unica vez sin ningun envoltorio adicional.
 
 EJEMPLOS DE KEYWORDS INCORRECTOS COMO FRASE (rechazar siempre este patron):
 - "GPT-Live OpenAI"        -> mal: dos nombres propios pegados, no es una frase
 - "Apple Broadcom Chips"   -> mal: tres sustantivos en ingles sin conector
-- "Moto Tag 2 Motorola"    -> mal: producto + marca sin relacion gramatical
 - "Apple demanda a OpenAI" -> mal: ya es una oracion con sujeto y verbo propios
 
 EJEMPLOS DE KEYWORDS CORRECTOS:
 - "modo de voz de ChatGPT"                          (sustantivo + complementos)
 - "chips de Apple con Broadcom"                     (sustantivo + complementos)
-- "rastreador Moto Tag 2"                           (sustantivo + nombre propio)
 - "demanda por secretos comerciales entre Apple y OpenAI"  (evento como sustantivo)
 
 CHECKLIST antes de definir el keyword final (las 4 deben dar SI):
@@ -1132,14 +1217,11 @@ no le agregues ni saques articulos.]
 COMO ESCRIBIR UN TITULO QUE REALMENTE ATRAIGA AL LECTOR (LO MAS IMPORTANTE)
 ===========================================
 El titulo es lo unico que decide si alguien entra a leer la nota o la ignora
-en el feed. Un titulo generico, tibio, o que suena a plantilla es la
-diferencia entre una nota leida y una nota muerta. Escribilo con estos
-principios de periodismo digital real, en este orden de importancia:
+en el feed. Escribilo con estos principios, en este orden de importancia:
 
 1. EMPEZA POR EL HECHO, NO POR UNA INTRODUCCION:
-   El sujeto real de la noticia (la empresa, el producto, la persona) o la
-   accion concreta van PRIMERO. Nunca antepongas una frase de relleno antes
-   del hecho.
+   El sujeto real de la noticia o la accion concreta van PRIMERO. Nunca
+   antepongas una frase de relleno antes del hecho.
    MAL: "Todo sobre el nuevo lanzamiento de Google para IA"
    BIEN: "Google lanza una IA que edita fotos con un solo comando de voz"
 
@@ -1151,49 +1233,47 @@ principios de periodismo digital real, en este orden de importancia:
 3. INCLUI UN DATO O NUMERO CONCRETO SI LA NOTICIA LO TIENE:
    Una cifra, un porcentaje, un precio, o un nombre propio ancla el titulo
    en la realidad y genera mas curiosidad que una descripcion abstracta.
-   MAS DEBIL: "Nueva actualizacion de seguridad para routers"
-   MAS FUERTE: "Cisco corrige una falla critica que exponia routers de medio mundo"
 
 4. GENERA UNA BRECHA DE CURIOSIDAD SIN CAER EN CLICKBAIT ENGAÑOSO:
    El lector tiene que sentir que falta un dato que solo consigue si entra
-   a leer (el "como", el "por que", el "cuanto"), pero el titulo NUNCA debe
-   prometer algo que el articulo no cumple. Nada de "no vas a creer que...".
+   a leer, pero el titulo NUNCA debe prometer algo que el articulo no cumple.
 
 5. LARGO Y RITMO:
-   Entre 50 y 60 caracteres. Frases cortas y directas, sin subordinadas
-   largas. Leelo en voz alta: si te trabas o suena a oracion de manual,
-   reescribilo mas corto y directo.
+   Entre 50 y 60 caracteres. Frases cortas y directas. Leelo en voz alta:
+   si te trabas o suena a oracion de manual, reescribilo mas corto y directo.
 
-6. EL FOCUS KEYWORD (string identico al definido arriba) tiene que aparecer
-   lo mas cerca posible del inicio del titulo, integrado naturalmente en la
-   frase que ya cumple los puntos 1 a 5 — nunca agregado como un parche al
-   final ni forzado con una plantilla generica.
+6. VERIFICACION OBLIGATORIA ANTES DE FIJAR EL TITULO (hace esto SIEMPRE,
+   no es opcional): tomá cada palabra significativa del FOCUS_KEYWORD
+   (nombres propios, sustantivos principales) y confirmá que NINGUNA vuelve
+   a aparecer en el resto del titulo fuera de la insercion del keyword. Si
+   encontras una repetida, DESCARTA ese titulo por completo y escribi uno
+   nuevo con un angulo distinto (no intentes "arreglar" el mismo titulo
+   sacando una palabra suelta, reescribilo desde cero).
+
+7. El FOCUS KEYWORD (string identico al definido arriba) tiene que aparecer
+   lo mas cerca posible del inicio del titulo, integrado naturalmente.
 
 EJEMPLOS DE ANTES/DESPUES (referencia de calidad esperada):
-- ANTES (generico): "Todo sobre el rebranding de NotebookLM a Gemini Notebook"
-  DESPUES (con gancho real): "Google rebautiza NotebookLM como Gemini Notebook"
-- ANTES (generico): "Todo sobre el modelo Inkling de Thinking Machines"
-  DESPUES (con gancho real): "Thinking Machines lanza Inkling, su primer modelo propio de IA"
-- ANTES (generico): "Todo sobre la consola Codex Micro de OpenAI y su impacto"
-  DESPUES (con gancho real): "OpenAI entra al hardware con la consola Codex Micro"
+- ANTES (repite "Google"): "Google activa el easter egg de Google por Marc Cucurella"
+  DESPUES (sin repetir): "Un buscador secreto de Google homenajea a Marc Cucurella"
+- ANTES (repite "Open Notebook"): "Open Notebook: la herramienta Open Notebook de IA local"
+  DESPUES (sin repetir): "Esta herramienta de IA local procesa tus datos sin subirlos a la nube"
 
 {bloque_titulos_previos}
 
 ## SLUG
 version-corta-en-minusculas-con-guiones-del-focus-keyword
 (5-6 palabras maximo). Si el keyword tiene conectores (de, con, para, entre),
-el slug tambien debe conservarlos como guion (ej: entre-apple-y-openai).
+el slug tambien debe conservarlos como guion.
 
 ## META_DESCRIPTION
 Entre 150 y 160 caracteres. Debe incluir el focus keyword (string identico).
-NO usar asteriscos ni markdown de ningun tipo dentro de este campo. Aplica
-los mismos principios de gancho del SEO_TITLE: hecho concreto + verbo activo,
-no una descripcion generica.
+NO usar asteriscos ni markdown de ningun tipo dentro de este campo.
 
 ## H1
 El titulo visible del articulo. Debe incluir el focus keyword (string identico).
-Aplica EXACTAMENTE los mismos 6 principios de gancho que el SEO_TITLE (puede
-ser identico al SEO_TITLE o una variacion minima, pero nunca mas generico).
+Aplica EXACTAMENTE los mismos 7 principios de gancho y verificacion que el
+SEO_TITLE (puede ser identico al SEO_TITLE o una variacion minima).
 
 ## ARTICULO
 El cuerpo de la nota en Markdown (600-900 palabras):
@@ -1201,26 +1281,18 @@ El cuerpo de la nota en Markdown (600-900 palabras):
 1. PRIMERA MENCION DEL KEYWORD (la mas importante):
    - Antes de escribir la oracion, preguntate DOS cosas:
      a) "¿el keyword ya trae su propio sujeto y verbo?" (Regla Critica #1)
-     b) "¿el keyword ya trae su propio sustantivo principal que mi frase
-        envolvente podria repetir?" (Regla Critica #2)
-   - Si (a) es cierto, usa un sujeto distinto para tu oracion, o reformula
-     para que el keyword entre como complemento/objeto.
-   - Si (b) es cierto, no repitas esa palabra sustantiva en el texto que
-     rodea directamente al keyword.
-   - El keyword debe aparecer como STRING EXACTO (mismas palabras, mismo
-     orden) dentro de una oracion que se lea 100% natural al leerla en voz alta.
-   - Releé la oracion completa antes de continuar: si suena repetitiva,
-     redundante, o forzada, reescribila desde cero cambiando el sujeto o
-     la estructura de la oracion, NUNCA cambiando el keyword.
+     b) "¿el keyword ya trae palabras significativas que mi frase envolvente
+        podria repetir?" (Regla Critica #2)
+   - Si (a) es cierto, usa un sujeto distinto para tu oracion.
+   - Si (b) es cierto, no repitas esas palabras en el texto que rodea
+     directamente al keyword.
+   - El keyword debe aparecer como STRING EXACTO dentro de una oracion que
+     se lea 100% natural al leerla en voz alta.
 
 2. SUBTITULOS (H2) — EL KEYWORD DEBE ESTAR PRESENTE:
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
-   - AL MENOS UNO de esos subtitulos (idealmente el primero o el segundo)
-     debe contener el focus keyword completo, o una VARIACION cercana del
-     mismo, siempre y cuando el subtitulo se siga leyendo natural.
-   - Los demas H2 pueden ser mas libres y tematicos (antecedentes, riesgos,
-     contexto de la industria), pero deben estar relacionados directamente
-     con el tema del articulo.
+   - AL MENOS UNO de esos subtitulos debe contener el focus keyword completo,
+     o una VARIACION cercana del mismo.
    - NUNCA repitas el keyword completo en mas de un H2.
 
 3. ESTRUCTURA GENERAL:
@@ -1228,7 +1300,6 @@ El cuerpo de la nota en Markdown (600-900 palabras):
 
 4. CONTENIDO:
    - NO copies frases textuales de la fuente; parafrasea completamente.
-   - Evita frases genericas de relleno tipicas de IA.
    - Voz activa, tono profesional pero cercano (español).
    - No menciones en el cuerpo del articulo el nombre de otros medios/fuentes.
 
@@ -1237,26 +1308,6 @@ El cuerpo de la nota en Markdown (600-900 palabras):
      keyword en el primer párrafo, asi:
      [{{el string exacto del keyword}}]({item['link']})
    {enlaces_instruccion}
-
-===========================================
-VALIDACION FINAL OBLIGATORIA (haceła antes de responder)
-===========================================
-Antes de entregar la respuesta, verificá vos mismo, CAMPO POR CAMPO:
-1. ¿El FOCUS_KEYWORD es idéntico, carácter por carácter, en SEO_TITLE, H1,
-   y en la primera mención dentro del ARTICULO?
-2. ¿El SEO_TITLE y el H1 arrancan con el HECHO concreto (sujeto+verbo activo),
-   no con una formula generica tipo "Todo sobre..." o similar?
-3. ¿El SEO_TITLE y el H1 evitan repetir la estructura de alguno de los
-   titulos recientes listados arriba (si los hay)?
-4. En el SEO_TITLE y H1: ¿la primera palabra sustantiva del keyword se repite
-   en la frase que lo envuelve? Si es así, reescribí el título completo.
-5. En el ARTICULO: ¿la oración donde aparece el keyword por primera vez
-   repite el mismo sujeto o el mismo sustantivo principal dos veces?
-6. ¿Al menos uno de los subtitulos H2 contiene el keyword completo o una
-   variacion cercana del mismo?
-7. Leé el SEO_TITLE en voz alta: ¿te dan ganas de saber mas, o suena a
-   relleno generico que podria aplicar a cualquier noticia? Si es lo segundo,
-   reescribilo desde cero antes de responder.
 
 ===========================================
 FORMATO DE SALIDA
@@ -1268,7 +1319,7 @@ Al final del ARTICULO, agrega: "Fuente: {fuentes_finales_str}"
 """
 
 # ----------------------------------------------------------------------
-# REDACCION CON GEMINI
+# REDACCION CON GEMINI + VALIDACION PROGRAMATICA CON REINTENTOS
 # ----------------------------------------------------------------------
 
 def call_gemini(prompt):
@@ -1278,6 +1329,52 @@ def call_gemini(prompt):
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError):
         raise RuntimeError(f"Respuesta inesperada de Gemini: {data}")
+
+def redactar_con_validacion(prompt_base, item):
+    """
+    Llama a Gemini para redactar el articulo, valida programaticamente el
+    resultado con validar_campos_generados (chequeo determinista en Python,
+    no depende de que el modelo se autoevalue), y si encuentra problemas de
+    repeticion en titulo/H1, le pide a Gemini que corrija especificamente
+    ese error, hasta MAX_REINTENTOS_TITULO veces.
+    """
+    prompt_actual = prompt_base
+    article = None
+
+    for intento in range(MAX_REINTENTOS_TITULO + 1):
+        article = call_gemini(prompt_actual)
+        problemas = validar_campos_generados(article)
+
+        if not problemas:
+            if intento > 0:
+                print(f"    ✅ Corregido tras {intento} reintento(s).")
+            return article
+
+        print(f"    ⚠️ Intento {intento + 1}: se detectaron {len(problemas)} problema(s):")
+        for p in problemas:
+            print(f"       - {p}")
+
+        if intento < MAX_REINTENTOS_TITULO:
+            correccion = "\n".join(f"- {p}" for p in problemas)
+            prompt_actual = prompt_base + f"""
+
+===========================================
+CORRECCION OBLIGATORIA (intento anterior fallo esta validacion automatica)
+===========================================
+Tu respuesta anterior tenia estos problemas EXACTOS, detectados por un
+chequeo automatico en codigo (no una opinion, un hecho verificado):
+
+{correccion}
+
+Volve a generar TODOS los campos desde cero, resolviendo especificamente
+estos problemas. Si el problema es repeticion de palabra en el titulo,
+reformula completamente esa oracion con una estructura distinta, no
+cambies el FOCUS_KEYWORD.
+"""
+
+    print(f"    ⚠️ Persisten problemas tras {MAX_REINTENTOS_TITULO} reintentos, "
+          f"se usa la ultima version generada de todos modos.")
+    return article
 
 # ----------------------------------------------------------------------
 # GUARDADO DE BORRADORES LOCALES
@@ -1305,7 +1402,7 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.2 (titulos con gancho + antirepeticion)...")
+    print("🚀 Iniciando pipeline Hybrid 4.3 (validacion programatica de titulos)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción/ranking) = {GEMINI_MODEL}")
     print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación) = {GEMINI_GROUNDING_MODEL}")
@@ -1353,7 +1450,7 @@ def main():
         fallback_image = full_article.get('top_image') if full_article else None
         imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
 
-        # 5. Redactar con Gemini (con todo el contexto triangulado + antirepeticion)
+        # 5. Redactar con Gemini + validacion programatica con reintentos
         try:
             titulos_recientes = load_titulos_recientes()
 
@@ -1364,7 +1461,7 @@ def main():
                 imagen_url=imagen_url,
                 titulos_recientes=titulos_recientes,
             )
-            article = call_gemini(prompt)
+            article = redactar_con_validacion(prompt, item)
             save_draft(item, article, imagen_url=imagen_url)
 
             seo_title_generado = extraer_seo_title(article)
