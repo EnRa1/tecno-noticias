@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 import trafilatura
 from readability import Document
 from bs4 import BeautifulSoup
+from scrapers.reuters import scrape_reuters_technology
 
 # ----------------------------------------------------------------------
 # CONFIGURACION
