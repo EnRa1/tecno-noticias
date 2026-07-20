@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.3 - Validacion Programatica)
+Pipeline de automatizacion para tecno.ar (Hybrid 4.4 - Categorias de menu + ranking en 2.5-flash)
 ==================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
-2. Filtro contextual con Gemini (1 sola llamada, con retry) -> elige las mejores
+2. Filtro contextual con Gemini (1 sola llamada, con retry, modelo 2.5-flash) -> elige las mejores
 3. Triangulacion de fuentes: grounding de Gemini (modelo fijo 2.5-flash) como
    metodo principal; cascada de Custom Search con filtro de relevancia como respaldo
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
@@ -115,6 +115,10 @@ KEYWORDS = [
     "inteligencia artificial", "ai", "ciberseguridad", "seguridad informatica",
     "software", "hardware", "app", "smartphone", "google", "microsoft",
     "apple", "startup", "tecnologia", "internet", "nube", "cloud",
+    "videojuego", "videojuegos", "gaming", "nintendo", "playstation", "xbox",
+    "auto electrico", "vehiculo electrico", "realidad aumentada",
+    "realidad virtual", "criptomoneda", "bitcoin", "blockchain",
+    "smart home", "domotica", "nasa", "espacio",
 ]
 
 STOPWORDS_ES = {
@@ -275,14 +279,7 @@ def detectar_repeticion_titulo(titulo, focus_keyword):
     """
     Detecta programaticamente si un titulo (SEO_TITLE o H1) repite una
     palabra significativa del focus_keyword FUERA de la insercion del
-    keyword en si. Esto es lo que falla cuando el modelo genera cosas como:
-    - "Google activa el easter egg de Google por..." (keyword ya contenia "Google")
-    - "Open Notebook: la herramienta Open Notebook de IA local" (keyword
-      ya contenia "Open Notebook" y se repite en la plantilla envolvente)
-
-    Metodo: ubica la posicion del keyword dentro del titulo, lo remueve,
-    y chequea si alguna palabra significativa (no stopword, longitud > 3)
-    del keyword aparece tambien en el resto del titulo.
+    keyword en si.
 
     Devuelve una lista de palabras repetidas (vacia si no hay problema).
     """
@@ -291,8 +288,6 @@ def detectar_repeticion_titulo(titulo, focus_keyword):
 
     idx = titulo_lower.find(keyword_lower)
     if idx == -1:
-        # El keyword ni siquiera aparece exacto; ese error lo maneja
-        # validar_campos_generados por separado.
         return []
 
     resto_titulo = titulo_lower[:idx] + titulo_lower[idx + len(keyword_lower):]
@@ -311,10 +306,7 @@ def detectar_repeticion_titulo(titulo, focus_keyword):
 
 def validar_campos_generados(article_md):
     """
-    Valida programaticamente el articulo generado por Gemini. Devuelve una
-    lista de strings describiendo cada problema encontrado (vacia si todo
-    esta OK). No depende de que el modelo se autoevalue; es un chequeo
-    determinista en Python que corre siempre despues de cada generacion.
+    Valida programaticamente el articulo generado por Gemini.
     """
     problemas = []
 
@@ -372,6 +364,9 @@ def is_recent(entry, max_hours=MAX_HOURS_OLD):
 # ----------------------------------------------------------------------
 # SISTEMA DE SCORING POR REGLAS
 # ----------------------------------------------------------------------
+# Las categorias de abajo estan alineadas al menu real de tecno.ar:
+# Smartphones / Hardware / Gaming / Empresas / Ciencia / Vehiculos / Hogar /
+# Mas Tecno (Cripto, Redes, Smartwatch, Gadgets) / RA / IA
 
 LAUNCH_KEYWORDS = [
     "lanza", "lanzamiento", "presenta", "presento", "anuncia", "anuncio",
@@ -382,21 +377,61 @@ LAUNCH_KEYWORDS = [
 HARDWARE_KEYWORDS = [
     "smartphone", "celular", "iphone", "procesador", "chip", "cpu", "gpu",
     "tarjeta grafica", "periferico", "teclado", "mouse", "auriculares",
-    "smart tv", "televisor", "auto electrico", "vehiculo electrico", "ev",
+    "smart tv", "televisor",
     "tablet", "notebook", "laptop", "smartwatch", "wearable", "consola",
     "placa de video", "motherboard", "placa madre", "bateria", "grafeno",
-]
-
-ARGENTINA_KEYWORDS = [
-    "argentina", "argentino", "buenos aires",
-    "mercado libre", "mercadolibre", "globant", "uala", "ualá",
-    "satellogic", "auth0", "despegar", "tiendanube",
 ]
 
 AI_KEYWORDS = [
     "inteligencia artificial", "modelo de ia", "llm", "chatgpt", "gemini",
     "claude", "openai", "anthropic", "copilot", "gpt-", "modelo de lenguaje",
     "machine learning", "deep learning", "red neuronal"
+]
+
+GAMING_KEYWORDS = [
+    "nintendo", "playstation", "ps5", "ps6", "xbox", "videojuego", "videojuegos",
+    "gaming", "steam", "epic games", "esports", "e-sports",
+    "consola de videojuegos", "switch 2", "game pass",
+]
+
+VEHICULOS_KEYWORDS = [
+    "auto electrico", "vehiculo electrico", "ev", "coche electrico",
+    "auto autonomo", "vehiculo autonomo", "tesla", "moto electrica",
+    "carga rapida", "autopilot", "conduccion autonoma",
+]
+
+RA_KEYWORDS = [
+    "realidad aumentada", "realidad virtual", "metaverso", "gafas de ra",
+    "gafas de rv", "vision pro", "quest 3", "lentes inteligentes", "xr",
+]
+
+CRIPTO_KEYWORDS = [
+    "criptomoneda", "criptomonedas", "bitcoin", "ethereum", "blockchain",
+    "cripto", "stablecoin", "web3", "nft",
+]
+
+CIENCIA_KEYWORDS = [
+    "nasa", "espacio", "cientificos", "estudio cientifico",
+    "investigacion cientifica", "fisica cuantica", "astronomia", "cohete",
+    "spacex", "descubrimiento cientifico", "mision espacial",
+]
+
+HOGAR_KEYWORDS = [
+    "smart home", "hogar inteligente", "domotica", "electrodomestico",
+    "electrodomesticos", "aspiradora robot", "robot aspirador",
+    "asistente de voz", "amazon echo", "google home",
+]
+
+EMPRESAS_KEYWORDS = [
+    "adquiere", "adquisicion", "fusion", "ronda de inversion", "invierte en",
+    "compra a", "acuerdo comercial", "alianza estrategica",
+    "ronda de financiamiento",
+]
+
+ARGENTINA_KEYWORDS = [
+    "argentina", "argentino", "buenos aires",
+    "mercado libre", "mercadolibre", "globant", "uala", "ualá",
+    "satellogic", "auth0", "despegar", "tiendanube",
 ]
 
 PENALTY_KEYWORDS = [
@@ -421,6 +456,40 @@ def compute_relevance_score(entry_text):
         if is_launch:
             score += 2
         categorias.append("ia")
+
+    if any(kw in text for kw in GAMING_KEYWORDS):
+        score += 3
+        if is_launch:
+            score += 2
+        categorias.append("gaming")
+
+    if any(kw in text for kw in VEHICULOS_KEYWORDS):
+        score += 3
+        if is_launch:
+            score += 2
+        categorias.append("vehiculos")
+
+    if any(kw in text for kw in RA_KEYWORDS):
+        score += 2
+        if is_launch:
+            score += 2
+        categorias.append("ra")
+
+    if any(kw in text for kw in CRIPTO_KEYWORDS):
+        score += 2
+        categorias.append("cripto")
+
+    if any(kw in text for kw in CIENCIA_KEYWORDS):
+        score += 2
+        categorias.append("ciencia")
+
+    if any(kw in text for kw in HOGAR_KEYWORDS):
+        score += 2
+        categorias.append("hogar")
+
+    if any(kw in text for kw in EMPRESAS_KEYWORDS):
+        score += 2
+        categorias.append("empresas")
 
     if is_launch and any(kw in text for kw in ARGENTINA_KEYWORDS):
         score += 1
@@ -790,15 +859,22 @@ def extract_full_article(url):
 # HELPER COMPARTIDO: LLAMADA A GEMINI CON RETRY/BACKOFF (redaccion/ranking)
 # ----------------------------------------------------------------------
 
-def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES):
+def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES, url=None):
+    """
+    url permite apuntar a un modelo distinto del default (GEMINI_URL).
+    Se usa, por ejemplo, para que el ranking pegue a GEMINI_GROUNDING_URL
+    (gemini-2.5-flash, modelo estable) en vez del modelo preview de
+    redaccion, que sufre mas 503/timeouts con prompts grandes.
+    """
     if not GEMINI_API_KEY:
         raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY")
 
+    url = url or GEMINI_URL
     last_error = None
 
     for attempt in range(retries):
         try:
-            resp = requests.post(GEMINI_URL, json=payload, timeout=60)
+            resp = requests.post(url, json=payload, timeout=60)
 
             if resp.status_code == 200:
                 return resp.json()
@@ -838,7 +914,8 @@ def rank_with_gemini(candidatos):
         print("⚠️ Sin API Key, usando orden por reglas.")
         return candidatos
 
-    print(f"🧠 Enviando {len(candidatos)} noticias a Gemini para ranking contextual...")
+    print(f"🧠 Enviando {len(candidatos)} noticias a Gemini ({GEMINI_GROUNDING_MODEL}) "
+          f"para ranking contextual...")
 
     lista_texto = ""
     for idx, item in enumerate(candidatos, 1):
@@ -847,7 +924,9 @@ def rank_with_gemini(candidatos):
     prompt = f"""
 Eres un editor jefe de un blog de tecnología llamado tecno.ar. Tu tarea es
 seleccionar las {MAX_ITEMS_PER_RUN} noticias MÁS RELEVANTES de la lista al final
-de este mensaje, aplicando los criterios de abajo EN ORDEN DE PRIORIDAD.
+de este mensaje, aplicando los criterios de abajo EN ORDEN DE PRIORIDAD. Estos
+criterios reflejan las secciones reales del menú de tecno.ar (Smartphones,
+Hardware, Gaming, Empresas, Ciencia, Vehículos, Hogar, Cripto, RA, IA).
 
 ===========================================
 CRITERIO 1 (máxima prioridad): LANZAMIENTOS OFICIALES DE HARDWARE O SOFTWARE
@@ -899,7 +978,61 @@ NO CALIFICA (ejemplos):
 - "¿Podría Apple comprar Netflix?" -> es especulación, no una negociación confirmada
 
 ===========================================
-CRITERIO 4 (mínima prioridad): CIBERSEGURIDAD
+CRITERIO 4: GAMING
+===========================================
+Lanzamientos oficiales de juegos, consolas, o anuncios confirmados de
+Nintendo, PlayStation, Xbox o estudios grandes.
+
+SI CALIFICA: "Nintendo confirma la fecha de lanzamiento del nuevo Zelda"
+NO CALIFICA: "Los mejores juegos indie de 2026" -> listicle, no un evento puntual
+
+===========================================
+CRITERIO 5: VEHÍCULOS
+===========================================
+Anuncios oficiales de autos eléctricos, autónomos, o novedades confirmadas
+de fabricantes de vehículos con foco tecnológico.
+
+SI CALIFICA: "Tesla presenta una actualización de Autopilot con nuevo hardware"
+NO CALIFICA: "Por qué los autos eléctricos son el futuro" -> opinión/ensayo
+
+===========================================
+CRITERIO 6: REALIDAD AUMENTADA Y VIRTUAL
+===========================================
+Lanzamientos concretos de dispositivos o software de RA/RV/metaverso.
+
+SI CALIFICA: "Meta lanza una actualización de software para Quest 3"
+NO CALIFICA: "El metaverso todavía no despegó, ¿por qué?" -> análisis retrospectivo
+
+===========================================
+CRITERIO 7: CRIPTOMONEDAS
+===========================================
+Eventos concretos y confirmados: lanzamientos de producto cripto de una
+empresa grande, regulación ya aprobada, movimientos de mercado relevantes
+y verificados (no especulación de precio).
+
+SI CALIFICA: "PayPal habilita pagos en Bitcoin para comercios en Argentina"
+NO CALIFICA: "¿Subirá el Bitcoin esta semana?" -> especulación de precio
+
+===========================================
+CRITERIO 8: CIENCIA
+===========================================
+Descubrimientos científicos verificados o misiones espaciales concretas
+con tecnología de por medio.
+
+SI CALIFICA: "SpaceX confirma la fecha del próximo lanzamiento de Starship"
+NO CALIFICA: "10 curiosidades sobre el universo" -> listicle genérico
+
+===========================================
+CRITERIO 9: HOGAR INTELIGENTE
+===========================================
+Lanzamientos concretos de productos domóticos o electrodomésticos
+inteligentes.
+
+SI CALIFICA: "Amazon presenta un nuevo Echo con IA integrada"
+NO CALIFICA: "Guía para armar tu smart home" -> contenido educativo genérico
+
+===========================================
+CRITERIO 10 (mínima prioridad): CIBERSEGURIDAD
 ===========================================
 Ataques reales ya ocurridos, vulnerabilidades críticas confirmadas (CVE,
 parches urgentes), o filtraciones de datos reales y verificadas.
@@ -954,7 +1087,7 @@ Formato exacto: {{"seleccionados": [3, 7, 12]}}
     }
 
     try:
-        data = call_gemini_api(payload, context="ranking")
+        data = call_gemini_api(payload, context="ranking", url=GEMINI_GROUNDING_URL)
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
         result = json.loads(raw_text)
         indices = result.get("seleccionados", [])
@@ -1403,10 +1536,10 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.3 (validacion programatica de titulos)...")
+    print("🚀 Iniciando pipeline Hybrid 4.4 (categorias de menu + ranking en 2.5-flash)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
-    print(f"DEBUG: GEMINI_MODEL (redacción/ranking) = {GEMINI_MODEL}")
-    print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación) = {GEMINI_GROUNDING_MODEL}")
+    print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
+    print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación + ranking) = {GEMINI_GROUNDING_MODEL}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
     print(f"DEBUG: GOOGLE_SEARCH_ENGINE_ID {'OK' if GOOGLE_SEARCH_ENGINE_ID else 'FALTA'}")
 
