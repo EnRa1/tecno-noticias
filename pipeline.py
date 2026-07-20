@@ -1306,7 +1306,7 @@ El cuerpo de la nota en Markdown (600-900 palabras):
 
 5. ENLACES:
    - El PRIMER enlace externo va exactamente sobre la mención del focus
-     keyword en el primer párrafo, asi:
+     keyword en los párrafos finales, asi:
      [{{el string exacto del keyword}}]({item['link']})
    {enlaces_instruccion}
 
