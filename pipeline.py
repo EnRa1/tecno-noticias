@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.4 - Categorias de menu + ranking en 2.5-flash)
+Pipeline de automatizacion para tecno.ar (Hybrid 4.5 - 5 items/corrida + cap con relleno)
 ==================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
-2. Filtro contextual con Gemini (1 sola llamada, con retry, modelo 2.5-flash) -> elige las mejores
+2. Filtro contextual con Gemini (1 sola llamada, con retry, modelo 2.5-flash) -> devuelve
+   un pool priorizado mas grande que MAX_ITEMS_PER_RUN, para poder aplicar el cap por
+   fuente sin perder noticias importantes si se concentran en un mismo medio
 3. Triangulacion de fuentes: grounding de Gemini (modelo fijo 2.5-flash) como
    metodo principal; cascada de Custom Search con filtro de relevancia como respaldo
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
@@ -58,11 +60,17 @@ GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY")
 GOOGLE_SEARCH_ENGINE_ID = os.environ.get("GOOGLE_SEARCH_ENGINE_ID")
 GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
 
-MAX_ITEMS_PER_RUN = 4
+MAX_ITEMS_PER_RUN = 5
 MAX_HOURS_OLD = 16
 DELAY_ENTRE_FASES = 15
 GEMINI_MAX_RETRIES = 4
 GEMINI_BASE_BACKOFF = 8
+
+# Cuantos indices priorizados le pedimos a Gemini en el ranking contextual.
+# Tiene que ser MAYOR a MAX_ITEMS_PER_RUN para que, si el cap por fuente
+# descarta algun candidato del top, todavia haya "suplentes" priorizados
+# para llenar ese lugar en vez de publicar menos de MAX_ITEMS_PER_RUN.
+RANKING_POOL_SIZE = MAX_ITEMS_PER_RUN + 5
 
 MAX_FUENTES_ADICIONALES = 2
 SEARCH_MAX_RETRIES = 2
@@ -862,9 +870,9 @@ def extract_full_article(url):
 def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES, url=None):
     """
     url permite apuntar a un modelo distinto del default (GEMINI_URL).
-    Se usa, por ejemplo, para que el ranking pegue a GEMINI_GROUNDING_URL
-    (gemini-2.5-flash, modelo estable) en vez del modelo preview de
-    redaccion, que sufre mas 503/timeouts con prompts grandes.
+    Se usa para que el ranking pegue a GEMINI_GROUNDING_URL (gemini-2.5-flash,
+    modelo estable) en vez del modelo preview de redaccion, que sufre mas
+    503/timeouts con prompts grandes.
     """
     if not GEMINI_API_KEY:
         raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY")
@@ -907,6 +915,13 @@ def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES, url=N
 # ----------------------------------------------------------------------
 
 def rank_with_gemini(candidatos):
+    """
+    Le pide a Gemini que devuelva un pool de RANKING_POOL_SIZE indices
+    ordenados por prioridad (no solo los MAX_ITEMS_PER_RUN finales). Esto
+    le da a fetch_new_relevant_items "suplentes" priorizados para poder
+    aplicar el cap por fuente sin perder noticias importantes cuando varias
+    de las mejores del dia se concentran en un mismo medio.
+    """
     if not candidatos or len(candidatos) <= MAX_ITEMS_PER_RUN:
         return candidatos
 
@@ -914,8 +929,10 @@ def rank_with_gemini(candidatos):
         print("⚠️ Sin API Key, usando orden por reglas.")
         return candidatos
 
+    pool_objetivo = min(len(candidatos), RANKING_POOL_SIZE)
+
     print(f"🧠 Enviando {len(candidatos)} noticias a Gemini ({GEMINI_GROUNDING_MODEL}) "
-          f"para ranking contextual...")
+          f"para ranking contextual (pool priorizado de {pool_objetivo})...")
 
     lista_texto = ""
     for idx, item in enumerate(candidatos, 1):
@@ -923,10 +940,17 @@ def rank_with_gemini(candidatos):
 
     prompt = f"""
 Eres un editor jefe de un blog de tecnología llamado tecno.ar. Tu tarea es
-seleccionar las {MAX_ITEMS_PER_RUN} noticias MÁS RELEVANTES de la lista al final
-de este mensaje, aplicando los criterios de abajo EN ORDEN DE PRIORIDAD. Estos
-criterios reflejan las secciones reales del menú de tecno.ar (Smartphones,
-Hardware, Gaming, Empresas, Ciencia, Vehículos, Hogar, Cripto, RA, IA).
+ORDENAR POR PRIORIDAD las {pool_objetivo} noticias MÁS RELEVANTES de la lista
+al final de este mensaje, aplicando los criterios de abajo EN ORDEN DE
+PRIORIDAD. Estos criterios reflejan las secciones reales del menú de tecno.ar
+(Smartphones, Hardware, Gaming, Empresas, Ciencia, Vehículos, Hogar, Cripto,
+RA, IA).
+
+IMPORTANTE: no selecciones solo un puñado fijo. Devolveme un RANKING de
+{pool_objetivo} noticias ordenadas de mas a menos relevante, porque despues
+un proceso automatico va a aplicar un limite de diversidad por medio sobre
+tu ranking, y necesita "suplentes" priorizados por si alguna noticia del
+tope queda descartada por venir del mismo medio que otra mejor rankeada.
 
 ===========================================
 CRITERIO 1 (máxima prioridad): LANZAMIENTOS OFICIALES DE HARDWARE O SOFTWARE
@@ -1072,10 +1096,10 @@ LISTA DE NOTICIAS A EVALUAR
 ===========================================
 FORMATO DE SALIDA (obligatorio)
 ===========================================
-Devolvé SOLO un JSON con los números de los {MAX_ITEMS_PER_RUN} índices
-seleccionados, en orden de prioridad (el más relevante primero).
-No agregues texto explicativo antes ni después del JSON.
-Formato exacto: {{"seleccionados": [3, 7, 12]}}
+Devolvé SOLO un JSON con los números de los {pool_objetivo} índices,
+ORDENADOS DE MAS A MENOS RELEVANTE (el primero de la lista es el mas
+relevante). No agregues texto explicativo antes ni después del JSON.
+Formato exacto: {{"seleccionados": [3, 7, 12, 1, 9]}}
 """
 
     payload = {
@@ -1094,27 +1118,67 @@ Formato exacto: {{"seleccionados": [3, 7, 12]}}
 
         if not indices:
             print("⚠️ Gemini no devolvió índices, usando orden por reglas.")
-            return candidatos[:MAX_ITEMS_PER_RUN]
+            return candidatos[:pool_objetivo]
 
         seleccionados = []
         for i in indices:
             if 1 <= i <= len(candidatos):
                 seleccionados.append(candidatos[i - 1])
-            if len(seleccionados) >= MAX_ITEMS_PER_RUN:
+            if len(seleccionados) >= pool_objetivo:
                 break
 
-        print(f"✅ Gemini seleccionó {len(seleccionados)} noticias por contexto.")
+        print(f"✅ Gemini devolvió un ranking priorizado de {len(seleccionados)} noticias.")
         return seleccionados
 
     except Exception as e:
         print(f"⚠️ No se pudo rankear con Gemini ({e}), usando orden por reglas.")
-        return candidatos[:MAX_ITEMS_PER_RUN]
+        return candidatos[:pool_objetivo]
 
 # ----------------------------------------------------------------------
 # INGESTA + FILTROS
 # ----------------------------------------------------------------------
 
 MAX_POR_FUENTE = max(1, MAX_ITEMS_PER_RUN // 2)
+
+def _seleccionar_final_con_relleno(ranking_priorizado):
+    """
+    Recorre el ranking priorizado (ya ordenado de mas a menos relevante)
+    en DOS pasadas:
+
+    1ra pasada: respeta MAX_POR_FUENTE (cap de diversidad por medio).
+    2da pasada (solo si hacen falta mas items para llegar a
+    MAX_ITEMS_PER_RUN): recorre los candidatos que quedaron afuera por el
+    cap, en el mismo orden de prioridad, IGNORANDO el cap, para no
+    desperdiciar un lugar cuando no hay suplentes de otras fuentes
+    disponibles. Prioriza llenar los MAX_ITEMS_PER_RUN lugares por sobre
+    mantener la diversidad artificial.
+    """
+    seleccionados_final = []
+    descartados_por_cap = []
+    conteo_por_fuente = {}
+
+    for item in ranking_priorizado:
+        if len(seleccionados_final) >= MAX_ITEMS_PER_RUN:
+            break
+        fuente = item["source"]
+        if conteo_por_fuente.get(fuente, 0) >= MAX_POR_FUENTE:
+            descartados_por_cap.append(item)
+            continue
+
+        seleccionados_final.append(item)
+        conteo_por_fuente[fuente] = conteo_por_fuente.get(fuente, 0) + 1
+
+    if len(seleccionados_final) < MAX_ITEMS_PER_RUN and descartados_por_cap:
+        faltan = MAX_ITEMS_PER_RUN - len(seleccionados_final)
+        print(f"    ℹ️ Faltan {faltan} noticia(s) para llegar a {MAX_ITEMS_PER_RUN}; "
+              f"se completa con candidatos que habían quedado afuera por el cap "
+              f"de diversidad por fuente, respetando el orden de prioridad.")
+        for item in descartados_por_cap:
+            if len(seleccionados_final) >= MAX_ITEMS_PER_RUN:
+                break
+            seleccionados_final.append(item)
+
+    return seleccionados_final
 
 def fetch_new_relevant_items():
     seen = load_seen()
@@ -1172,22 +1236,13 @@ def fetch_new_relevant_items():
         print("🔪 Limitando a 30 para el ranking contextual.")
 
     if len(candidatos) > MAX_ITEMS_PER_RUN:
-        seleccionados_por_ia = rank_with_gemini(candidatos)
+        ranking_priorizado = rank_with_gemini(candidatos)
     else:
-        seleccionados_por_ia = candidatos
+        ranking_priorizado = candidatos
 
-    seleccionados_final = []
-    conteo_por_fuente = {}
+    seleccionados_final = _seleccionar_final_con_relleno(ranking_priorizado)
 
-    for item in seleccionados_por_ia:
-        if len(seleccionados_final) >= MAX_ITEMS_PER_RUN:
-            break
-        fuente = item["source"]
-        if conteo_por_fuente.get(fuente, 0) >= MAX_POR_FUENTE:
-            continue
-
-        seleccionados_final.append(item)
-        conteo_por_fuente[fuente] = conteo_por_fuente.get(fuente, 0) + 1
+    for item in seleccionados_final:
         seen[item["hash"]] = {"title": item["title"], "date": datetime.now().isoformat()}
 
     save_seen(seen)
@@ -1536,10 +1591,12 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.4 (categorias de menu + ranking en 2.5-flash)...")
+    print("🚀 Iniciando pipeline Hybrid 4.5 (5 items/corrida + cap con relleno)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
     print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación + ranking) = {GEMINI_GROUNDING_MODEL}")
+    print(f"DEBUG: MAX_ITEMS_PER_RUN = {MAX_ITEMS_PER_RUN} | RANKING_POOL_SIZE = {RANKING_POOL_SIZE} "
+          f"| MAX_POR_FUENTE = {MAX_POR_FUENTE}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
     print(f"DEBUG: GOOGLE_SEARCH_ENGINE_ID {'OK' if GOOGLE_SEARCH_ENGINE_ID else 'FALTA'}")
 
