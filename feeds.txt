@@ -1,6 +1,9 @@
 https://techcrunch.com/feed/
 https://www.theverge.com/rss/index.xml
 https://www.wired.com/feed/rss
-https://hipertextual.com/feed
-
+https://www.criptonoticias.com/feed/
+https://www.dualshockers.com/feed/video-game-news/
+https://www.techradar.com/feeds/articletype/news
+https://www.techradar.com/feeds/tag/phones
+https://www.techradar.com/feeds/tag/smart-home
 
