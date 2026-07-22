@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.5 - 5 items/corrida + cap con relleno)
+Pipeline de automatizacion para tecno.ar (Hybrid 4.6 - Prueba en paralelo con Groq)
 ==================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry, modelo 2.5-flash) -> devuelve
@@ -13,6 +13,10 @@ Pipeline de automatizacion para tecno.ar (Hybrid 4.5 - 5 items/corrida + cap con
 6. Redaccion con Gemini + VALIDACION PROGRAMATICA (no depende de autoevaluacion
    del modelo): detecta repeticion de palabras en titulo/H1 en Python puro y
    pide correccion especifica con reintentos si encuentra problemas
+7. PRUEBA EN PARALELO: ademas de la redaccion de produccion (Gemini), genera una
+   segunda version de cada nota usando Groq (openai/gpt-oss-120b) con el MISMO
+   prompt exacto, guardada aparte en drafts_test_groq/ para comparar calidad.
+   No afecta el flujo de publicacion a WordPress.
 """
 
 import feedparser
@@ -37,6 +41,7 @@ BASE_DIR = Path(__file__).parent
 FEEDS_FILE = BASE_DIR / "feeds.txt"
 SEEN_FILE = BASE_DIR / "seen.json"
 DRAFTS_DIR = BASE_DIR / "drafts"
+TEST_DRAFTS_DIR = BASE_DIR / "drafts_test_groq"
 TITULOS_RECIENTES_FILE = BASE_DIR / "titulos_recientes.json"
 
 MAX_TITULOS_RECIENTES = 15
@@ -55,6 +60,11 @@ GEMINI_GROUNDING_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_GROUNDING_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
+
+# --- Groq (prueba en paralelo de redaccion) ---
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY")
 GOOGLE_SEARCH_ENGINE_ID = os.environ.get("GOOGLE_SEARCH_ENGINE_ID")
@@ -314,7 +324,8 @@ def detectar_repeticion_titulo(titulo, focus_keyword):
 
 def validar_campos_generados(article_md):
     """
-    Valida programaticamente el articulo generado por Gemini.
+    Valida programaticamente el articulo generado. No depende de que
+    modelo lo genero (sirve tanto para Gemini como para Groq).
     """
     problemas = []
 
@@ -909,6 +920,66 @@ def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES, url=N
             continue
 
     raise RuntimeError(f"Se agotaron los reintentos en {context}: {last_error}")
+
+# ----------------------------------------------------------------------
+# HELPER GROQ: LLAMADA CON RETRY/BACKOFF (formato estilo OpenAI)
+# ----------------------------------------------------------------------
+
+def call_groq_api(payload, context="groq", retries=GEMINI_MAX_RETRIES):
+    if not GROQ_API_KEY:
+        raise RuntimeError("Falta la variable de entorno GROQ_API_KEY")
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            resp = requests.post(GROQ_URL, json=payload, headers=headers, timeout=60)
+
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code == 429:
+                wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
+                print(f"[RATE LIMIT] {context}: intento {attempt + 1}/{retries}, esperando {wait}s...")
+                time.sleep(wait)
+                last_error = RuntimeError(f"429 rate limit tras {retries} intentos ({context})")
+                continue
+            elif resp.status_code >= 500:
+                wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
+                print(f"[SERVER ERROR] {context}: {resp.status_code}, esperando {wait}s...")
+                time.sleep(wait)
+                last_error = RuntimeError(f"Error {resp.status_code} ({context})")
+                continue
+            else:
+                raise RuntimeError(f"Error Groq {resp.status_code} ({context}): {resp.text[:300]}")
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            wait = GEMINI_BASE_BACKOFF * (2 ** attempt)
+            print(f"[NETWORK ERROR] {context}: {type(e).__name__}, esperando {wait}s...")
+            time.sleep(wait)
+            last_error = e
+            continue
+
+    raise RuntimeError(f"Se agotaron los reintentos en {context}: {last_error}")
+
+def call_groq(prompt):
+    """
+    Equivalente a call_gemini(), pero con formato de payload estilo OpenAI
+    (messages en vez de contents/parts) para pegarle a Groq.
+    """
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+    }
+    data = call_groq_api(payload, context="redaccion-groq")
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Respuesta inesperada de Groq: {data}")
 
 # ----------------------------------------------------------------------
 # FILTRO CONTEXTUAL CON GEMINI (1 SOLA LLAMADA, CON RETRY)
@@ -1565,6 +1636,48 @@ cambies el FOCUS_KEYWORD.
           f"se usa la ultima version generada de todos modos.")
     return article
 
+def redactar_con_validacion_groq(prompt_base, item):
+    """
+    Igual que redactar_con_validacion, pero llamando a Groq (openai/gpt-oss-120b)
+    en vez de Gemini. Se usa SOLO para comparar calidad en paralelo; no
+    reemplaza el flujo principal de redaccion (que sigue siendo Gemini).
+    """
+    prompt_actual = prompt_base
+    article = None
+
+    for intento in range(MAX_REINTENTOS_TITULO + 1):
+        article = call_groq(prompt_actual)
+        problemas = validar_campos_generados(article)
+
+        if not problemas:
+            if intento > 0:
+                print(f"    ✅ [Groq] Corregido tras {intento} reintento(s).")
+            return article
+
+        print(f"    ⚠️ [Groq] Intento {intento + 1}: se detectaron {len(problemas)} problema(s):")
+        for p in problemas:
+            print(f"       - {p}")
+
+        if intento < MAX_REINTENTOS_TITULO:
+            correccion = "\n".join(f"- {p}" for p in problemas)
+            prompt_actual = prompt_base + f"""
+
+===========================================
+CORRECCION OBLIGATORIA (intento anterior fallo esta validacion automatica)
+===========================================
+Tu respuesta anterior tenia estos problemas EXACTOS, detectados por un
+chequeo automatico en codigo (no una opinion, un hecho verificado):
+
+{correccion}
+
+Volve a generar TODOS los campos desde cero, resolviendo especificamente
+estos problemas. No cambies el FOCUS_KEYWORD.
+"""
+
+    print(f"    ⚠️ [Groq] Persisten problemas tras {MAX_REINTENTOS_TITULO} reintentos, "
+          f"se usa la ultima version de todos modos.")
+    return article
+
 # ----------------------------------------------------------------------
 # GUARDADO DE BORRADORES LOCALES
 # ----------------------------------------------------------------------
@@ -1586,15 +1699,39 @@ def save_draft(item, article_md, imagen_url=None):
     path.write_text(header + article_md, encoding="utf-8")
     print(f"[OK] Borrador guardado localmente: {path}")
 
+def save_draft_test_groq(item, article_md):
+    """
+    Guarda la version de PRUEBA generada con Groq, en una carpeta separada
+    de la de produccion. No interfiere con publish_to_wordpress.py, que
+    sigue leyendo unicamente de DRAFTS_DIR.
+    """
+    TEST_DRAFTS_DIR.mkdir(exist_ok=True)
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    filename = f"{date_str}_{slugify(item['title'])}_GROQ.md"
+    path = TEST_DRAFTS_DIR / filename
+
+    header = (
+        f"<!--\n"
+        f"ESTADO: version de PRUEBA generada con {GROQ_MODEL} (Groq)\n"
+        f"Comparar con el borrador equivalente en drafts/\n"
+        f"Fuente original: {item['link']}\n"
+        f"Fecha generacion: {datetime.now().isoformat()}\n"
+        f"-->\n\n"
+    )
+    path.write_text(header + article_md, encoding="utf-8")
+    print(f"[OK] Borrador de prueba (Groq) guardado: {path}")
+
 # ----------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.5 (5 items/corrida + cap con relleno)...")
+    print("🚀 Iniciando pipeline Hybrid 4.6 (prueba en paralelo con Groq)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
+    print(f"DEBUG: GROQ_API_KEY {'OK' if GROQ_API_KEY else 'FALTA (se omite la prueba en paralelo)'}")
     print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
     print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación + ranking) = {GEMINI_GROUNDING_MODEL}")
+    print(f"DEBUG: GROQ_MODEL (prueba en paralelo de redacción) = {GROQ_MODEL}")
     print(f"DEBUG: MAX_ITEMS_PER_RUN = {MAX_ITEMS_PER_RUN} | RANKING_POOL_SIZE = {RANKING_POOL_SIZE} "
           f"| MAX_POR_FUENTE = {MAX_POR_FUENTE}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
@@ -1659,6 +1796,19 @@ def main():
             if seo_title_generado:
                 guardar_titulo_reciente(seo_title_generado)
                 print(f"📝 Título registrado en historial: {seo_title_generado}")
+
+            # --- PRUEBA EN PARALELO: misma noticia, redactada con Groq ---
+            # Usa el MISMO prompt exacto que la version de produccion, para
+            # que la comparacion de calidad sea justa. No afecta a
+            # publish_to_wordpress.py, que solo lee de drafts/.
+            if GROQ_API_KEY:
+                try:
+                    print("🧪 Generando version de prueba con Groq (gpt-oss-120b)...")
+                    article_groq = redactar_con_validacion_groq(prompt, item)
+                    save_draft_test_groq(item, article_groq)
+                except Exception as e_groq:
+                    print(f"[WARN] Prueba con Groq falló para '{item['title']}': {e_groq}")
+            # --- fin prueba en paralelo ---
 
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
