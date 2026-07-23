@@ -374,7 +374,7 @@ def is_recent(entry, max_hours=MAX_HOURS_OLD):
 # ----------------------------------------------------------------------
 # Las categorias de abajo estan alineadas al menu real de tecno.ar:
 # Smartphones / Hardware / Gaming / Empresas / Ciencia / Vehiculos / Hogar /
-# Mas Tecno (Cripto, Redes, Smartwatch, Gadgets) / RA / IA
+# Mas Tecno (Cripto, Redes, Smartwatch, Gadgets) / RA / IA / Ciberseguridad
 
 LAUNCH_KEYWORDS = [
     "lanza", "lanzamiento", "presenta", "presento", "anuncia", "anuncio",
@@ -430,6 +430,19 @@ HOGAR_KEYWORDS = [
     "asistente de voz", "amazon echo", "google home",
 ]
 
+CIBERSEGURIDAD_KEYWORDS = [
+    "ciberseguridad", "seguridad informatica", "vulnerabilidad", "vulnerabilidades",
+    "ransomware", "malware", "phishing", "exploit", "zero-day", "cve",
+    "filtracion de datos", "brecha de datos", "hackeo", "hackearon",
+    "ciberataque", "ciberataques", "parche de seguridad", "grupo de hackers",
+]
+
+CIBERSEGURIDAD_EVENTO_KEYWORDS = [
+    "ataca", "ataco", "vulnera", "vulneraron", "expone", "expusieron",
+    "filtra", "filtraron", "hackea", "hackearon", "compromete",
+    "comprometieron", "parche disponible", "ya hay parche",
+]
+
 EMPRESAS_KEYWORDS = [
     "adquiere", "adquisicion", "fusion", "ronda de inversion", "invierte en",
     "compra a", "acuerdo comercial", "alianza estrategica",
@@ -477,14 +490,22 @@ def compute_relevance_score(entry_text):
             score += 2
         categorias.append("vehiculos")
 
+    if any(kw in text for kw in CIBERSEGURIDAD_KEYWORDS):
+        score += 3
+        if any(kw in text for kw in CIBERSEGURIDAD_EVENTO_KEYWORDS):
+            score += 2
+        categorias.append("ciberseguridad")
+
     if any(kw in text for kw in RA_KEYWORDS):
-        score += 2
+        score += 3
         if is_launch:
             score += 2
         categorias.append("ra")
 
     if any(kw in text for kw in CRIPTO_KEYWORDS):
-        score += 2
+        score += 3
+        if is_launch:
+            score += 2
         categorias.append("cripto")
 
     if any(kw in text for kw in CIENCIA_KEYWORDS):
@@ -492,15 +513,19 @@ def compute_relevance_score(entry_text):
         categorias.append("ciencia")
 
     if any(kw in text for kw in HOGAR_KEYWORDS):
-        score += 2
+        score += 3
+        if is_launch:
+            score += 2   
         categorias.append("hogar")
 
     if any(kw in text for kw in EMPRESAS_KEYWORDS):
-        score += 2
+        score += 3
+        if is_launch:
+            score += 2
         categorias.append("empresas")
 
     if is_launch and any(kw in text for kw in ARGENTINA_KEYWORDS):
-        score += 1
+        score += 2
         categorias.append("argentina")
 
     if any(kw in text for kw in PENALTY_KEYWORDS):
@@ -940,11 +965,8 @@ def rank_with_gemini(candidatos):
 
     prompt = f"""
 Eres un editor jefe de un blog de tecnología llamado tecno.ar. Tu tarea es
-ORDENAR POR PRIORIDAD las {pool_objetivo} noticias MÁS RELEVANTES de la lista
-al final de este mensaje, aplicando los criterios de abajo EN ORDEN DE
-PRIORIDAD. Estos criterios reflejan las secciones reales del menú de tecno.ar
-(Smartphones, Hardware, Gaming, Empresas, Ciencia, Vehículos, Hogar, Cripto,
-RA, IA).
+ORDENAR POR RELEVANCIA REAL las {pool_objetivo} noticias más importantes de
+la lista al final de este mensaje.
 
 IMPORTANTE: no selecciones solo un puñado fijo. Devolveme un RANKING de
 {pool_objetivo} noticias ordenadas de mas a menos relevante, porque despues
@@ -953,140 +975,84 @@ tu ranking, y necesita "suplentes" priorizados por si alguna noticia del
 tope queda descartada por venir del mismo medio que otra mejor rankeada.
 
 ===========================================
-CRITERIO 1 (máxima prioridad): LANZAMIENTOS OFICIALES DE HARDWARE O SOFTWARE
+REGLA DE ORO: NINGUNA CATEGORÍA VALE MÁS QUE OTRA POR DEFAULT
 ===========================================
-Es la noticia PRIMARIA de un producto que sale al mercado, se anuncia
-oficialmente, o se actualiza con una versión nueva. La empresa fabricante
-o desarrolladora es quien hace el anuncio (no un tercero especulando).
+tecno.ar cubre Smartphones, Hardware, Gaming, Empresas, Ciencia, Vehículos,
+Hogar, Cripto, RA/RV, IA y Ciberseguridad. Estas categorías son TODAS de
+igual jerarquía de partida. NO existe una tabla de prioridad fija donde
+"lanzamiento de hardware" le gane automáticamente a "ciberseguridad" o
+viceversa. Una vulnerabilidad crítica real, un ransomware que afectó a
+miles de usuarios, o una filtración de datos masiva DEBEN poder superar en
+el ranking a un lanzamiento de producto menor, si su impacto real es mayor.
+Evaluá cada noticia por su propio mérito periodístico, no por a qué
+categoría pertenece.
 
-SI CALIFICA (ejemplos):
-- "Samsung presenta el Galaxy S26 con nuevo procesador propio"
-- "Apple lanza iOS 20 con rediseño completo de la interfaz"
-- "NVIDIA anuncia la nueva serie RTX 6000 para gaming"
+Para eso, aplicá estos CUATRO EJES a CADA noticia, sin importar su tema:
 
-NO CALIFICA (ejemplos):
-- "Se filtran posibles specs del próximo iPhone" -> es rumor/filtración, no lanzamiento oficial
-- "5 cosas que esperamos ver en el próximo Galaxy Unpacked" -> es especulación/preview, no anuncio real
-- "Análisis: por qué el nuevo MacBook no convence" -> es opinión/review, no la noticia del lanzamiento en sí
+EJE 1 — CONFIRMACIÓN Y CONCRETITUD (¿pasó de verdad, o es especulación?)
+Puntuación alta: hecho confirmado oficialmente por la empresa/organismo
+involucrado, o evento ya ocurrido y verificable (un ataque real, una
+vulnerabilidad con CVE o parche confirmado, un lanzamiento oficial, una
+fusión firmada, una misión ejecutada).
+Puntuación baja o descarte: rumores, filtraciones sin confirmar,
+especulación ("se espera que", "podría", "estaría preparando"),
+reflexiones genéricas sobre el futuro de una tecnología.
 
-===========================================
-CRITERIO 2: AVANCES REALES EN INTELIGENCIA ARTIFICIAL
-===========================================
-Modelos nuevos, funciones nuevas lanzadas, o aplicaciones prácticas ya
-disponibles. Debe ser un avance concreto y verificable, no una promesa a futuro
-ni una reflexión general sobre "el futuro de la IA".
+EJE 2 — IMPACTO Y ALCANCE REAL
+¿A cuánta gente afecta, o qué tan grande es la empresa/sistema involucrado?
+Una vulnerabilidad crítica en software usado por millones, un ransomware
+que tumbó una aerolínea, o una adquisición multimillonaria tienen el MISMO
+nivel de impacto que el lanzamiento de un fabricante líder — no menos. Un
+anuncio menor de una empresa poco conocida, o un parche de una
+vulnerabilidad de bajo riesgo, tienen impacto bajo, sea cual sea su
+categoría.
 
-SI CALIFICA (ejemplos):
-- "OpenAI lanza GPT-6 con capacidades de razonamiento mejoradas"
-- "Google integra Gemini directamente en Google Sheets"
-- "Anthropic presenta Claude con nueva función de memoria persistente"
+EJE 3 — ACTUALIDAD
+Qué tan reciente y puntual es el hecho dentro de la ventana de tiempo
+cubierta. Más reciente y más "de hoy" puntúa mejor que algo que ya se viene
+arrastrando hace días.
 
-NO CALIFICA (ejemplos):
-- "Cómo la IA cambiará el trabajo en los próximos 10 años" -> es un ensayo/opinión, no una noticia de un avance concreto
-- "Empresas advierten sobre riesgos regulatorios de la IA" -> es cobertura de políticas/regulación, no un avance de producto
-- "Rumores indican que Meta prepara un nuevo modelo" -> es especulación sin confirmación oficial
-
-===========================================
-CRITERIO 3: EMPRESAS DE TECNOLOGÍA (negociaciones, tratos, convenios)
-===========================================
-Adquisiciones, fusiones, rondas de inversión, alianzas estratégicas o
-convenios comerciales concretos y confirmados entre empresas.
-
-SI CALIFICA (ejemplos):
-- "Microsoft adquiere la startup de ciberseguridad XDR por USD 500 millones"
-- "Mercado Libre firma un convenio con Visa para pagos internacionales"
-- "Globant anuncia una ronda de inversión de USD 200 millones"
-
-NO CALIFICA (ejemplos):
-- "Las 10 empresas tech más valiosas del mundo en 2026" -> es un ranking/listicle, no una noticia de un trato concreto
-- "¿Podría Apple comprar Netflix?" -> es especulación, no una negociación confirmada
-
-===========================================
-CRITERIO 4: GAMING
-===========================================
-Lanzamientos oficiales de juegos, consolas, o anuncios confirmados de
-Nintendo, PlayStation, Xbox o estudios grandes.
-
-SI CALIFICA: "Nintendo confirma la fecha de lanzamiento del nuevo Zelda"
-NO CALIFICA: "Los mejores juegos indie de 2026" -> listicle, no un evento puntual
+EJE 4 — VALOR INFORMATIVO PARA EL LECTOR
+¿Le aporta algo concreto al lector (una fecha, un riesgo de seguridad que
+debería conocer y mitigar, un producto que puede comprar, un dato
+verificable)? Se descarta siempre, sin importar el tema: opinión o análisis
+retrospectivo ("por qué X importa", "lo que aprendimos de..."), rankings y
+listicles ("top 10", "lo mejor de la semana"), reviews de productos que ya
+llevan tiempo en el mercado, y contenido educativo genérico sin un hecho
+puntual detrás — un "10 consejos para protegerte de hackers" se descarta
+exactamente igual que un "10 curiosidades sobre el universo".
 
 ===========================================
-CRITERIO 5: VEHÍCULOS
+CÓMO SE VE UN EJE 1 ALTO EN CADA CATEGORÍA (ejemplos, no jerarquía)
 ===========================================
-Anuncios oficiales de autos eléctricos, autónomos, o novedades confirmadas
-de fabricantes de vehículos con foco tecnológico.
+- Hardware/Smartphones: "Samsung presenta el Galaxy S26 con nuevo procesador propio"
+- IA: "OpenAI lanza GPT-6 con capacidades de razonamiento mejoradas"
+- Empresas: "Microsoft adquiere la startup de ciberseguridad XDR por USD 500 millones"
+- Gaming: "Nintendo confirma la fecha de lanzamiento del nuevo Zelda"
+- Vehículos: "Tesla presenta una actualización de Autopilot con nuevo hardware"
+- RA/RV: "Meta lanza una actualización de software para Quest 3"
+- Cripto: "PayPal habilita pagos en Bitcoin para comercios en Argentina"
+- Ciencia: "SpaceX confirma la fecha del próximo lanzamiento de Starship"
+- Hogar: "Amazon presenta un nuevo Echo con IA integrada"
+- Ciberseguridad: "Ransomware ataca los servidores de una aerolínea europea" /
+  "Descubren vulnerabilidad crítica en routers Cisco, ya hay parche
+  disponible" / "Filtración expone datos de 2 millones de usuarios de una
+  app de delivery"
 
-SI CALIFICA: "Tesla presenta una actualización de Autopilot con nuevo hardware"
-NO CALIFICA: "Por qué los autos eléctricos son el futuro" -> opinión/ensayo
-
-===========================================
-CRITERIO 6: REALIDAD AUMENTADA Y VIRTUAL
-===========================================
-Lanzamientos concretos de dispositivos o software de RA/RV/metaverso.
-
-SI CALIFICA: "Meta lanza una actualización de software para Quest 3"
-NO CALIFICA: "El metaverso todavía no despegó, ¿por qué?" -> análisis retrospectivo
-
-===========================================
-CRITERIO 7: CRIPTOMONEDAS
-===========================================
-Eventos concretos y confirmados: lanzamientos de producto cripto de una
-empresa grande, regulación ya aprobada, movimientos de mercado relevantes
-y verificados (no especulación de precio).
-
-SI CALIFICA: "PayPal habilita pagos en Bitcoin para comercios en Argentina"
-NO CALIFICA: "¿Subirá el Bitcoin esta semana?" -> especulación de precio
+Ejemplos de EJE 1 bajo o descarte en cualquier categoría: "Se filtran
+posibles specs del próximo iPhone" (rumor), "5 cosas que esperamos ver en
+el próximo Galaxy Unpacked" (especulación/preview), "Los ciberataques más
+comunes en 2026" (listicle genérico), "¿Podría Apple comprar Netflix?"
+(especulación sin negociación real).
 
 ===========================================
-CRITERIO 8: CIENCIA
+CÓMO DECIDIR ENTRE VARIAS NOTICIAS CON PUNTAJE SIMILAR
 ===========================================
-Descubrimientos científicos verificados o misiones espaciales concretas
-con tecnología de por medio.
-
-SI CALIFICA: "SpaceX confirma la fecha del próximo lanzamiento de Starship"
-NO CALIFICA: "10 curiosidades sobre el universo" -> listicle genérico
-
-===========================================
-CRITERIO 9: HOGAR INTELIGENTE
-===========================================
-Lanzamientos concretos de productos domóticos o electrodomésticos
-inteligentes.
-
-SI CALIFICA: "Amazon presenta un nuevo Echo con IA integrada"
-NO CALIFICA: "Guía para armar tu smart home" -> contenido educativo genérico
-
-===========================================
-CRITERIO 10 (mínima prioridad): CIBERSEGURIDAD
-===========================================
-Ataques reales ya ocurridos, vulnerabilidades críticas confirmadas (CVE,
-parches urgentes), o filtraciones de datos reales y verificadas.
-
-SI CALIFICA (ejemplos):
-- "Ransomware ataca los servidores de una aerolínea europea"
-- "Descubren vulnerabilidad crítica en routers de Cisco, ya hay parche disponible"
-- "Filtración expone datos de 2 millones de usuarios de una app de delivery"
-
-NO CALIFICA (ejemplos):
-- "10 consejos para protegerte de hackers" -> es contenido educativo genérico, no una noticia de un incidente real
-- "Los ciberataques más comunes en 2026" -> es un resumen/listicle, no un evento puntual
-
-===========================================
-CRITERIO DE DESCARTE (aplica a cualquier categoría, siempre)
-===========================================
-Ignorá SIEMPRE, sin importar el tema, artículos que sean:
-- Opinión o análisis retrospectivo ("por qué X importa", "lo que aprendimos de...")
-- Rumores, filtraciones o especulación sin confirmación oficial de la empresa
-- Rankings, resúmenes, "top 10", "lo mejor de la semana", roundups
-- Reviews de productos que ya llevan tiempo en el mercado (no son lanzamientos nuevos)
-
-===========================================
-CÓMO DECIDIR ENTRE VARIAS NOTICIAS DEL MISMO CRITERIO
-===========================================
-Si hay más candidatas de las que necesitás dentro de un mismo criterio,
-priorizá la que tenga: (a) confirmación oficial más directa de la empresa
-involucrada, (b) mayor impacto o alcance (una empresa grande y conocida
-pesa más que una startup poco conocida), (c) mayor actualidad (evento más
-reciente dentro de la ventana de tiempo).
+Si varias noticias quedan parejas tras aplicar los 4 ejes, priorizá la que
+tenga: (a) confirmación oficial más directa, (b) mayor impacto o alcance
+(más usuarios/empresas afectadas pesa más que un caso aislado), (c) mayor
+actualidad dentro de la ventana de tiempo. Esto aplica igual entre dos
+noticias de la misma categoría o de categorías distintas.
 
 ===========================================
 LISTA DE NOTICIAS A EVALUAR
@@ -1467,7 +1433,7 @@ SEO_TITLE (puede ser identico al SEO_TITLE o una variacion minima).
 ## ARTICULO
 El cuerpo de la nota en Markdown (600-900 palabras):
 
-1. PRIMERA MENCION DEL KEYWORD (la mas importante):
+1. MENCION DEL KEYWORD (la mas importante):
    - Antes de escribir la oracion, preguntate DOS cosas:
      a) "¿el keyword ya trae su propio sujeto y verbo?" (Regla Critica #1)
      b) "¿el keyword ya trae palabras significativas que mi frase envolvente
@@ -1477,11 +1443,11 @@ El cuerpo de la nota en Markdown (600-900 palabras):
      directamente al keyword.
    - El keyword debe aparecer como STRING EXACTO dentro de una oracion que
      se lea 100% natural al leerla en voz alta.
+   - El keyword debe tener una densidad dentro del cuerpo de aproximadamente %1,3.
 
 2. SUBTITULOS (H2) — EL KEYWORD DEBE ESTAR PRESENTE:
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
-   - AL MENOS UNO de esos subtitulos debe contener el focus keyword completo,
-     o una VARIACION cercana del mismo.
+   - AL MENOS UNO de esos subtitulos debe contener el focus keyword completo.
    - NUNCA repitas el keyword completo en mas de un H2.
 
 3. ESTRUCTURA GENERAL:
