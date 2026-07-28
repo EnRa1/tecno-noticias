@@ -536,7 +536,10 @@ def is_recent(entry, max_hours=MAX_HOURS_OLD):
 LAUNCH_KEYWORDS = [
     "lanza", "lanzamiento", "presenta", "presento", "anuncia", "anuncio",
     "debuta", "revela", "sale a la venta", "disponible desde", "estrena",
-    "launches", "unveils", "announces", "introduces", "debuts", "reveals",
+    "confirma", "confirmo", "confirmacion",
+    "launches", "launch", "unveils", "unveil", "announces", "announce",
+    "announcement", "introduces", "introduce", "debuts", "debut",
+    "reveals", "reveal", "releases", "release", "rolls out", "confirms",
 ]
 
 HARDWARE_KEYWORDS = [
@@ -545,46 +548,79 @@ HARDWARE_KEYWORDS = [
     "smart tv", "televisor",
     "tablet", "notebook", "laptop", "smartwatch", "wearable", "consola",
     "placa de video", "motherboard", "placa madre", "bateria", "grafeno",
+    # ingles
+    "smartphones", "processor", "graphics card", "peripheral", "keyboard",
+    "headphones", "earbuds", "television", "computer", "monitor",
+    "console", "motherboard", "battery", "graphene", "semiconductor",
+    "semiconductors", "chipset", "display", "screen", "camera sensor",
+    "fast charging", "usb-c",
 ]
 
 AI_KEYWORDS = [
     "inteligencia artificial", "modelo de ia", "llm", "chatgpt", "gemini",
     "claude", "openai", "anthropic", "copilot", "gpt-", "modelo de lenguaje",
-    "machine learning", "deep learning", "red neuronal"
+    "machine learning", "deep learning", "red neuronal",
+    # ingles
+    "artificial intelligence", "ai model", "language model",
+    "neural network", "generative ai", "ia generativa", "agentic ai",
+    "ia agentica", "computer vision", "vision artificial", "nlp",
+    "natural language processing", "meta ai", "grok", "perplexity",
+    "midjourney", "stable diffusion", "large language model",
 ]
 
 GAMING_KEYWORDS = [
     "nintendo", "playstation", "ps5", "ps6", "xbox", "videojuego", "videojuegos",
     "gaming", "steam", "epic games", "esports", "e-sports",
     "consola de videojuegos", "switch 2", "game pass",
+    # ingles
+    "videogame", "videogames", "gamer", "gamers", "console gaming",
+    "unreal engine", "unity engine", "multiplayer", "esport",
 ]
 
 VEHICULOS_KEYWORDS = [
     "auto electrico", "vehiculo electrico", "ev", "coche electrico",
     "auto autonomo", "vehiculo autonomo", "tesla", "moto electrica",
     "carga rapida", "autopilot", "conduccion autonoma",
+    # ingles
+    "electric vehicle", "electric car", "self-driving", "self driving",
+    "autonomous vehicle", "autonomous driving", "robotaxi",
+    "electric motorcycle", "fast charging",
 ]
 
 RA_KEYWORDS = [
     "realidad aumentada", "realidad virtual", "metaverso", "gafas de ra",
     "gafas de rv", "vision pro", "quest 3", "lentes inteligentes", "xr",
+    # ingles
+    "augmented reality", "virtual reality", "metaverse", "smart glasses",
+    "mixed reality", "realidad mixta", "quest headset",
 ]
 
 CRIPTO_KEYWORDS = [
     "criptomoneda", "criptomonedas", "bitcoin", "ethereum", "blockchain",
     "cripto", "stablecoin", "web3", "nft",
+    # ingles
+    "cryptocurrency", "crypto", "defi", "crypto wallet", "crypto exchange",
 ]
 
 CIENCIA_KEYWORDS = [
     "nasa", "espacio", "cientificos", "estudio cientifico",
     "investigacion cientifica", "fisica cuantica", "astronomia", "cohete",
     "spacex", "descubrimiento cientifico", "mision espacial",
+    # ingles
+    "space", "scientists", "scientific study", "scientific research",
+    "quantum physics", "quantum computing", "computacion cuantica",
+    "astronomy", "rocket", "scientific discovery", "space mission",
+    "satellite", "satelite", "telescope", "telescopio", "mars", "marte",
 ]
 
 HOGAR_KEYWORDS = [
     "smart home", "hogar inteligente", "domotica", "electrodomestico",
     "electrodomesticos", "aspiradora robot", "robot aspirador",
     "asistente de voz", "amazon echo", "google home",
+    # ingles
+    "voice assistant", "alexa", "google assistant", "siri",
+    "smart appliance", "iot", "internet de las cosas", "internet of things",
+    "robot vacuum",
 ]
 
 CIBERSEGURIDAD_KEYWORDS = [
@@ -592,18 +628,31 @@ CIBERSEGURIDAD_KEYWORDS = [
     "ransomware", "malware", "phishing", "exploit", "zero-day", "cve",
     "filtracion de datos", "brecha de datos", "hackeo", "hackearon",
     "ciberataque", "ciberataques", "parche de seguridad", "grupo de hackers",
+    # ingles
+    "cybersecurity", "cyber security", "infosec", "vulnerability",
+    "vulnerabilities", "zero day", "data breach", "data leak",
+    "cyberattack", "cyber attack", "security patch", "hacking group",
+    "spyware", "trojan", "botnet", "ddos", "spoofing", "encryption",
 ]
 
 CIBERSEGURIDAD_EVENTO_KEYWORDS = [
     "ataca", "ataco", "vulnera", "vulneraron", "expone", "expusieron",
     "filtra", "filtraron", "hackea", "hackearon", "compromete",
     "comprometieron", "parche disponible", "ya hay parche",
+    # ingles
+    "attacks", "attacked", "exposes", "exposed", "leaks", "leaked",
+    "hacks", "hacked", "compromises", "compromised", "patch available",
+    "patch released", "breached",
 ]
 
 EMPRESAS_KEYWORDS = [
     "adquiere", "adquisicion", "fusion", "ronda de inversion", "invierte en",
     "compra a", "acuerdo comercial", "alianza estrategica",
     "ronda de financiamiento",
+    # ingles
+    "acquires", "acquisition", "merger", "funding round", "invests in",
+    "investment round", "strategic partnership", "strategic alliance",
+    "ipo",
 ]
 
 ARGENTINA_KEYWORDS = [
@@ -614,7 +663,10 @@ ARGENTINA_KEYWORDS = [
 
 PENALTY_KEYWORDS = [
     "lo que tenés que saber", "imperdible", "no te pierdas", "resumen del día",
-    "lo mejor de", "top 5", "top 10"
+    "lo mejor de", "top 5", "top 10",
+    # ingles
+    "what you need to know", "don't miss", "everything you need to know",
+    "best of", "top 5", "top 10", "roundup",
 ]
 
 def compute_relevance_score(entry_text):
