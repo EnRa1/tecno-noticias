@@ -30,5 +30,5 @@ https://chargedevs.com/feed/
 https://electrek.co/feed/
 https://insideevs.com/rss/articles/all/
 https://cleantechnica.com/category/clean-transport-2/electric-vehicles/feed/
-
+https://news.samsung.com/global/feed
 
