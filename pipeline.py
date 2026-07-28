@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.5 - 5 items/corrida + cap con relleno)
+Pipeline de automatizacion para tecno.ar (Hybrid 4.6 - 5 items/corrida + cap con relleno
++ historial de categorias para diversidad tematica)
 ==================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry, modelo 2.5-flash) -> devuelve
    un pool priorizado mas grande que MAX_ITEMS_PER_RUN, para poder aplicar el cap por
-   fuente sin perder noticias importantes si se concentran en un mismo medio
+   fuente sin perder noticias importantes si se concentran en un mismo medio.
+   Ademas recibe el HISTORIAL DE CATEGORIAS de las ultimas notas publicadas, para usarlo
+   como criterio de DESEMPATE (no como cuota dura) y evitar que el feed se concentre
+   siempre en las mismas 1-2 categorias.
 3. Triangulacion de fuentes: grounding de Gemini (modelo fijo 2.5-flash) como
    metodo principal; cascada de Custom Search con filtro de relevancia como respaldo
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
@@ -22,6 +26,7 @@ import os
 import re
 import time
 import hashlib
+from collections import Counter
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -38,8 +43,10 @@ FEEDS_FILE = BASE_DIR / "feeds.txt"
 SEEN_FILE = BASE_DIR / "seen.json"
 DRAFTS_DIR = BASE_DIR / "drafts"
 TITULOS_RECIENTES_FILE = BASE_DIR / "titulos_recientes.json"
+CATEGORIAS_RECIENTES_FILE = BASE_DIR / "categorias_recientes.json"
 
 MAX_TITULOS_RECIENTES = 15
+MAX_CATEGORIAS_RECIENTES = 20  # ventana de "memoria" para el desempate por diversidad
 MAX_REINTENTOS_TITULO = 2
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -172,6 +179,30 @@ def guardar_titulo_reciente(seo_title):
     titulos = titulos[-MAX_TITULOS_RECIENTES:]
     TITULOS_RECIENTES_FILE.write_text(
         json.dumps(titulos, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+def load_categorias_recientes():
+    """
+    Devuelve la lista de categorias (string, ej: 'ia', 'ciberseguridad',
+    'gaming') de las ultimas notas publicadas, en orden cronologico
+    (la mas vieja primero). Se usa como contexto de diversidad para el
+    ranking de Gemini, no como filtro duro.
+    """
+    if CATEGORIAS_RECIENTES_FILE.exists():
+        try:
+            return json.loads(CATEGORIAS_RECIENTES_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return []
+    return []
+
+def guardar_categoria_reciente(categoria):
+    if not categoria:
+        return
+    categorias = load_categorias_recientes()
+    categorias.append(categoria)
+    categorias = categorias[-MAX_CATEGORIAS_RECIENTES:]
+    CATEGORIAS_RECIENTES_FILE.write_text(
+        json.dumps(categorias, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 def extraer_campo(article_md, nombre_campo):
@@ -939,13 +970,19 @@ def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES, url=N
 # FILTRO CONTEXTUAL CON GEMINI (1 SOLA LLAMADA, CON RETRY)
 # ----------------------------------------------------------------------
 
-def rank_with_gemini(candidatos):
+def rank_with_gemini(candidatos, categorias_recientes=None):
     """
     Le pide a Gemini que devuelva un pool de RANKING_POOL_SIZE indices
     ordenados por prioridad (no solo los MAX_ITEMS_PER_RUN finales). Esto
     le da a fetch_new_relevant_items "suplentes" priorizados para poder
     aplicar el cap por fuente sin perder noticias importantes cuando varias
     de las mejores del dia se concentran en un mismo medio.
+
+    categorias_recientes: lista de categorias (str) de las ultimas notas
+    publicadas. Se usa SOLO como criterio de desempate para favorecer
+    diversidad tematica cuando dos o mas candidatos quedan parejos en
+    merito periodistico — nunca como cuota dura ni para descartar una
+    noticia fuerte por su categoria.
     """
     if not candidatos or len(candidatos) <= MAX_ITEMS_PER_RUN:
         return candidatos
@@ -955,6 +992,14 @@ def rank_with_gemini(candidatos):
         return candidatos
 
     pool_objetivo = min(len(candidatos), RANKING_POOL_SIZE)
+    categorias_recientes = categorias_recientes or []
+    conteo_categorias = Counter(categorias_recientes)
+    if conteo_categorias:
+        resumen_categorias = ", ".join(
+            f"{cat}: {n}" for cat, n in conteo_categorias.most_common()
+        )
+    else:
+        resumen_categorias = "sin datos previos"
 
     print(f"🧠 Enviando {len(candidatos)} noticias a Gemini ({GEMINI_GROUNDING_MODEL}) "
           f"para ranking contextual (pool priorizado de {pool_objetivo})...")
@@ -1053,6 +1098,22 @@ tenga: (a) confirmación oficial más directa, (b) mayor impacto o alcance
 (más usuarios/empresas afectadas pesa más que un caso aislado), (c) mayor
 actualidad dentro de la ventana de tiempo. Esto aplica igual entre dos
 noticias de la misma categoría o de categorías distintas.
+
+===========================================
+CONTEXTO DE DIVERSIDAD TEMATICA (criterio de DESEMPATE, no reemplaza los
+4 ejes de arriba)
+===========================================
+Estas son las categorías de las últimas {len(categorias_recientes)} notas
+publicadas en tecno.ar (de más vieja a más reciente): {resumen_categorias}
+
+Esto NO es una cuota ni un límite. Los 4 ejes siguen siendo el criterio
+principal, y una categoría sobrerrepresentada puede perfectamente tener hoy
+la noticia más importante del lote — en ese caso va primero igual. Usá este
+contexto SOLO para desempatar cuando dos o más noticias queden realmente
+parejas en mérito periodístico: en ese caso, dale prioridad en el ranking a
+la que pertenezca a una categoría menos representada en el historial
+reciente, para que el feed no se concentre siempre en las mismas 1-2
+categorías.
 
 ===========================================
 LISTA DE NOTICIAS A EVALUAR
@@ -1201,8 +1262,10 @@ def fetch_new_relevant_items():
         candidatos = candidatos[:30]
         print("🔪 Limitando a 30 para el ranking contextual.")
 
+    categorias_recientes = load_categorias_recientes()
+
     if len(candidatos) > MAX_ITEMS_PER_RUN:
-        ranking_priorizado = rank_with_gemini(candidatos)
+        ranking_priorizado = rank_with_gemini(candidatos, categorias_recientes=categorias_recientes)
     else:
         ranking_priorizado = candidatos
 
@@ -1557,12 +1620,14 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.5 (5 items/corrida + cap con relleno)...")
+    print("🚀 Iniciando pipeline Hybrid 4.6 (5 items/corrida + cap con relleno "
+          "+ diversidad de categorias)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
     print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación + ranking) = {GEMINI_GROUNDING_MODEL}")
     print(f"DEBUG: MAX_ITEMS_PER_RUN = {MAX_ITEMS_PER_RUN} | RANKING_POOL_SIZE = {RANKING_POOL_SIZE} "
           f"| MAX_POR_FUENTE = {MAX_POR_FUENTE}")
+    print(f"DEBUG: MAX_CATEGORIAS_RECIENTES (ventana de diversidad) = {MAX_CATEGORIAS_RECIENTES}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
     print(f"DEBUG: GOOGLE_SEARCH_ENGINE_ID {'OK' if GOOGLE_SEARCH_ENGINE_ID else 'FALTA'}")
 
@@ -1625,6 +1690,13 @@ def main():
             if seo_title_generado:
                 guardar_titulo_reciente(seo_title_generado)
                 print(f"📝 Título registrado en historial: {seo_title_generado}")
+
+            # Registramos la categoria de esta nota en el historial de
+            # diversidad, para que el proximo ranking la tenga en cuenta
+            # como criterio de desempate.
+            guardar_categoria_reciente(item.get("categoria_reglas"))
+            print(f"🗂️ Categoría registrada en historial de diversidad: "
+                  f"{item.get('categoria_reglas')}")
 
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
