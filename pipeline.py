@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.6 - 5 items/corrida + cap con relleno
-+ historial de categorias para diversidad tematica)
+Pipeline de automatizacion para tecno.ar (Hybrid 4.7 - 5 items/corrida + cap con relleno
++ historial de categorias para diversidad tematica + dedup tematico manejado por IA)
 ==================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry, modelo 2.5-flash) -> devuelve
@@ -9,7 +9,10 @@ Pipeline de automatizacion para tecno.ar (Hybrid 4.6 - 5 items/corrida + cap con
    fuente sin perder noticias importantes si se concentran en un mismo medio.
    Ademas recibe el HISTORIAL DE CATEGORIAS de las ultimas notas publicadas, para usarlo
    como criterio de DESEMPATE (no como cuota dura) y evitar que el feed se concentre
-   siempre en las mismas 1-2 categorias.
+   siempre en las mismas 1-2 categorias. Tambien recibe el HISTORIAL DE TEMAS ya
+   publicados y la propia lista a evaluar, para descartar duplicados tematicos
+   (mismo hecho cubierto por medios distintos) directamente en el criterio del modelo,
+   sin depender de similitud de texto en Python.
 3. Triangulacion de fuentes: grounding de Gemini (modelo fijo 2.5-flash) como
    metodo principal; cascada de Custom Search con filtro de relevancia como respaldo
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
@@ -44,9 +47,11 @@ SEEN_FILE = BASE_DIR / "seen.json"
 DRAFTS_DIR = BASE_DIR / "drafts"
 TITULOS_RECIENTES_FILE = BASE_DIR / "titulos_recientes.json"
 CATEGORIAS_RECIENTES_FILE = BASE_DIR / "categorias_recientes.json"
+TEMAS_RECIENTES_FILE = BASE_DIR / "temas_recientes.json"
 
 MAX_TITULOS_RECIENTES = 15
 MAX_CATEGORIAS_RECIENTES = 20  # ventana de "memoria" para el desempate por diversidad
+MAX_TEMAS_RECIENTES = 15       # ventana de "memoria" para dedup tematico (misma hecho)
 MAX_REINTENTOS_TITULO = 2
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -203,6 +208,33 @@ def guardar_categoria_reciente(categoria):
     categorias = categorias[-MAX_CATEGORIAS_RECIENTES:]
     CATEGORIAS_RECIENTES_FILE.write_text(
         json.dumps(categorias, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+def load_temas_recientes():
+    """
+    Devuelve una lista de dicts {'title': ..., 'summary': ...} de las
+    ultimas notas publicadas, para que Gemini pueda detectar si una
+    noticia candidata cubre el MISMO HECHO que algo ya publicado
+    recientemente (aunque venga de un medio distinto o tenga un titulo
+    distinto). Es un chequeo semantico hecho por el modelo, no una
+    comparacion de similitud de texto en Python.
+    """
+    if TEMAS_RECIENTES_FILE.exists():
+        try:
+            return json.loads(TEMAS_RECIENTES_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return []
+    return []
+
+def guardar_tema_reciente(item):
+    temas = load_temas_recientes()
+    temas.append({
+        "title": item["title"],
+        "summary": item["summary"][:250],
+    })
+    temas = temas[-MAX_TEMAS_RECIENTES:]
+    TEMAS_RECIENTES_FILE.write_text(
+        json.dumps(temas, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 def extraer_campo(article_md, nombre_campo):
@@ -970,7 +1002,7 @@ def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES, url=N
 # FILTRO CONTEXTUAL CON GEMINI (1 SOLA LLAMADA, CON RETRY)
 # ----------------------------------------------------------------------
 
-def rank_with_gemini(candidatos, categorias_recientes=None):
+def rank_with_gemini(candidatos, categorias_recientes=None, temas_recientes=None):
     """
     Le pide a Gemini que devuelva un pool de RANKING_POOL_SIZE indices
     ordenados por prioridad (no solo los MAX_ITEMS_PER_RUN finales). Esto
@@ -983,8 +1015,25 @@ def rank_with_gemini(candidatos, categorias_recientes=None):
     diversidad tematica cuando dos o mas candidatos quedan parejos en
     merito periodistico — nunca como cuota dura ni para descartar una
     noticia fuerte por su categoria.
+
+    temas_recientes: lista de dicts {'title', 'summary'} de las ultimas
+    notas YA PUBLICADAS. Se usa para que el propio Gemini descarte
+    candidatos que cubran el MISMO HECHO que algo ya publicado, y tambien
+    para deduplicar entre si los candidatos de la lista actual (ej. tres
+    medios distintos cubriendo la misma noticia en la misma corrida).
+    Esto es un chequeo semantico hecho por el modelo, no una comparacion
+    de similitud de texto en Python.
     """
-    if not candidatos or len(candidatos) <= MAX_ITEMS_PER_RUN:
+    if not candidatos:
+        return candidatos
+
+    categorias_recientes = categorias_recientes or []
+    temas_recientes = temas_recientes or []
+
+    # Si hay pocos candidatos Y no hay historial de temas que chequear,
+    # no vale la pena gastar una llamada a Gemini: no hay nada para
+    # rankear ni para deduplicar.
+    if len(candidatos) <= MAX_ITEMS_PER_RUN and not temas_recientes:
         return candidatos
 
     if not GEMINI_API_KEY:
@@ -992,7 +1041,6 @@ def rank_with_gemini(candidatos, categorias_recientes=None):
         return candidatos
 
     pool_objetivo = min(len(candidatos), RANKING_POOL_SIZE)
-    categorias_recientes = categorias_recientes or []
     conteo_categorias = Counter(categorias_recientes)
     if conteo_categorias:
         resumen_categorias = ", ".join(
@@ -1002,11 +1050,30 @@ def rank_with_gemini(candidatos, categorias_recientes=None):
         resumen_categorias = "sin datos previos"
 
     print(f"🧠 Enviando {len(candidatos)} noticias a Gemini ({GEMINI_GROUNDING_MODEL}) "
-          f"para ranking contextual (pool priorizado de {pool_objetivo})...")
+          f"para ranking contextual (pool priorizado de hasta {pool_objetivo})...")
 
     lista_texto = ""
     for idx, item in enumerate(candidatos, 1):
         lista_texto += f"{idx}. Título: {item['title']}\n   Resumen: {item['summary'][:250]}\n\n"
+
+    bloque_temas_previos = ""
+    if temas_recientes:
+        lista_temas = "\n".join(
+            f"- {t['title']}: {t['summary'][:150]}" for t in temas_recientes
+        )
+        bloque_temas_previos = f"""
+===========================================
+TEMAS YA PUBLICADOS RECIENTEMENTE (NO REPETIR)
+===========================================
+Estas son las últimas {len(temas_recientes)} notas ya publicadas en tecno.ar:
+
+{lista_temas}
+
+Si alguna noticia de la lista a evaluar cubre el MISMO HECHO que una de estas
+(mismo evento, mismo anuncio, mismo caso puntual — aunque venga de un medio
+distinto o tenga un título distinto), NO la incluyas en tu ranking, sin
+importar su mérito periodístico. Ya fue cubierta y no debe repetirse.
+"""
 
     prompt = f"""
 Eres un editor jefe de un blog de tecnología llamado tecno.ar. Tu tarea es
@@ -1014,10 +1081,11 @@ ORDENAR POR RELEVANCIA REAL las {pool_objetivo} noticias más importantes de
 la lista al final de este mensaje.
 
 IMPORTANTE: no selecciones solo un puñado fijo. Devolveme un RANKING de
-{pool_objetivo} noticias ordenadas de mas a menos relevante, porque despues
-un proceso automatico va a aplicar un limite de diversidad por medio sobre
-tu ranking, y necesita "suplentes" priorizados por si alguna noticia del
-tope queda descartada por venir del mismo medio que otra mejor rankeada.
+hasta {pool_objetivo} noticias ordenadas de mas a menos relevante, porque
+despues un proceso automatico va a aplicar un limite de diversidad por
+medio sobre tu ranking, y necesita "suplentes" priorizados por si alguna
+noticia del tope queda descartada por venir del mismo medio que otra mejor
+rankeada.
 
 ===========================================
 REGLA DE ORO: NINGUNA CATEGORÍA VALE MÁS QUE OTRA POR DEFAULT
@@ -1114,6 +1182,17 @@ parejas en mérito periodístico: en ese caso, dale prioridad en el ranking a
 la que pertenezca a una categoría menos representada en el historial
 reciente, para que el feed no se concentre siempre en las mismas 1-2
 categorías.
+{bloque_temas_previos}
+===========================================
+DEDUPLICACION DENTRO DE ESTA MISMA LISTA
+===========================================
+Ademas de descartar temas ya publicados, revisá si DOS O MÁS noticias de la
+lista a evaluar (mas abajo) hablan del MISMO HECHO puntual entre sí (mismo
+anuncio, mismo evento, mismo caso — aunque vengan de medios distintos y con
+títulos distintos). Si eso pasa, NO incluyas a todas en el ranking: elegí
+solo la mejor cubierta (la más completa, con fuente más oficial, o más
+reciente) y descartá al resto como si no existieran. El ranking final no
+puede tener dos entradas sobre el mismo hecho.
 
 ===========================================
 LISTA DE NOTICIAS A EVALUAR
@@ -1123,10 +1202,12 @@ LISTA DE NOTICIAS A EVALUAR
 ===========================================
 FORMATO DE SALIDA (obligatorio)
 ===========================================
-Devolvé SOLO un JSON con los números de los {pool_objetivo} índices,
-ORDENADOS DE MAS A MENOS RELEVANTE (el primero de la lista es el mas
-relevante). No agregues texto explicativo antes ni después del JSON.
-Formato exacto: {{"seleccionados": [3, 7, 12, 1, 9]}}
+Devolvé SOLO un JSON con los números de los índices que sobrevivan a la
+deduplicación (temas ya publicados + duplicados internos), ORDENADOS DE MAS
+A MENOS RELEVANTE (el primero de la lista es el mas relevante). Puede haber
+menos de {pool_objetivo} índices si se descartaron duplicados; eso es
+correcto y esperado. No agregues texto explicativo antes ni después del
+JSON. Formato exacto: {{"seleccionados": [3, 7, 12, 1, 9]}}
 """
 
     payload = {
@@ -1144,7 +1225,8 @@ Formato exacto: {{"seleccionados": [3, 7, 12, 1, 9]}}
         indices = result.get("seleccionados", [])
 
         if not indices:
-            print("⚠️ Gemini no devolvió índices, usando orden por reglas.")
+            print("⚠️ Gemini no devolvió índices (puede que haya descartado todo por "
+                  "duplicado), usando orden por reglas como respaldo.")
             return candidatos[:pool_objetivo]
 
         seleccionados = []
@@ -1154,7 +1236,8 @@ Formato exacto: {{"seleccionados": [3, 7, 12, 1, 9]}}
             if len(seleccionados) >= pool_objetivo:
                 break
 
-        print(f"✅ Gemini devolvió un ranking priorizado de {len(seleccionados)} noticias.")
+        print(f"✅ Gemini devolvió un ranking priorizado de {len(seleccionados)} noticias "
+              f"(deduplicado contra historial y contra sí mismo).")
         return seleccionados
 
     except Exception as e:
@@ -1263,11 +1346,13 @@ def fetch_new_relevant_items():
         print("🔪 Limitando a 30 para el ranking contextual.")
 
     categorias_recientes = load_categorias_recientes()
+    temas_recientes = load_temas_recientes()
 
-    if len(candidatos) > MAX_ITEMS_PER_RUN:
-        ranking_priorizado = rank_with_gemini(candidatos, categorias_recientes=categorias_recientes)
-    else:
-        ranking_priorizado = candidatos
+    ranking_priorizado = rank_with_gemini(
+        candidatos,
+        categorias_recientes=categorias_recientes,
+        temas_recientes=temas_recientes,
+    )
 
     seleccionados_final = _seleccionar_final_con_relleno(ranking_priorizado)
 
@@ -1620,14 +1705,15 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.6 (5 items/corrida + cap con relleno "
-          "+ diversidad de categorias)...")
+    print("🚀 Iniciando pipeline Hybrid 4.7 (5 items/corrida + cap con relleno "
+          "+ diversidad de categorias + dedup tematico por IA)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
     print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación + ranking) = {GEMINI_GROUNDING_MODEL}")
     print(f"DEBUG: MAX_ITEMS_PER_RUN = {MAX_ITEMS_PER_RUN} | RANKING_POOL_SIZE = {RANKING_POOL_SIZE} "
           f"| MAX_POR_FUENTE = {MAX_POR_FUENTE}")
     print(f"DEBUG: MAX_CATEGORIAS_RECIENTES (ventana de diversidad) = {MAX_CATEGORIAS_RECIENTES}")
+    print(f"DEBUG: MAX_TEMAS_RECIENTES (ventana de dedup tematico) = {MAX_TEMAS_RECIENTES}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
     print(f"DEBUG: GOOGLE_SEARCH_ENGINE_ID {'OK' if GOOGLE_SEARCH_ENGINE_ID else 'FALTA'}")
 
@@ -1697,6 +1783,12 @@ def main():
             guardar_categoria_reciente(item.get("categoria_reglas"))
             print(f"🗂️ Categoría registrada en historial de diversidad: "
                   f"{item.get('categoria_reglas')}")
+
+            # Registramos el tema (titulo + resumen) de esta nota en el
+            # historial de dedup, para que el proximo ranking de Gemini
+            # pueda descartar noticias que cubran el mismo hecho.
+            guardar_tema_reciente(item)
+            print(f"🧩 Tema registrado en historial de dedup: {item['title'][:60]}")
 
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
