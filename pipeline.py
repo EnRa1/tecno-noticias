@@ -132,13 +132,107 @@ REQUEST_HEADERS = {
 }
 
 KEYWORDS = [
-    "inteligencia artificial", "ai", "ciberseguridad", "seguridad informatica",
-    "software", "hardware", "app", "smartphone", "google", "microsoft",
-    "apple", "startup", "tecnologia", "internet", "nube", "cloud",
-    "videojuego", "videojuegos", "gaming", "nintendo", "playstation", "xbox",
-    "auto electrico", "vehiculo electrico", "realidad aumentada",
-    "realidad virtual", "criptomoneda", "bitcoin", "blockchain",
-    "smart home", "domotica", "nasa", "espacio",
+    # Términos generales de tecnología
+    "tecnologia", "technology", "tech", "innovacion", "innovation",
+    "gadget", "gadgets", "digital", "electronica", "electronics",
+    "dispositivo", "device", "actualizacion", "update", "firmware",
+
+    # Inteligencia artificial
+    "inteligencia artificial", "ai", "artificial intelligence", "ia",
+    "machine learning", "aprendizaje automatico", "deep learning",
+    "aprendizaje profundo", "red neuronal", "neural network",
+    "llm", "modelo de lenguaje", "language model", "chatbot",
+    "chatgpt", "gemini", "claude", "copilot", "gpt-", "openai",
+    "anthropic", "meta ai", "grok", "perplexity", "midjourney",
+    "generative ai", "ia generativa", "agentic ai", "ia agentica",
+    "computer vision", "vision artificial", "nlp", "procesamiento de lenguaje natural",
+
+    # Ciberseguridad
+    "ciberseguridad", "seguridad informatica", "cybersecurity",
+    "cyber security", "infosec", "hacker", "hackers", "hacking",
+    "hackeo", "hackearon", "vulnerabilidad", "vulnerabilidades",
+    "vulnerability", "vulnerabilities", "exploit", "zero-day", "zero day",
+    "ransomware", "malware", "spyware", "phishing", "cve",
+    "filtracion de datos", "data breach", "brecha de datos", "data leak",
+    "ciberataque", "ciberataques", "cyberattack", "hackeado",
+    "parche de seguridad", "security patch", "grupo de hackers",
+    "vpn", "firewall", "encriptacion", "encryption", "autenticacion",
+    "authentication", "contraseña", "password", "botnet", "ddos",
+    "troyano", "trojan", "spoofing", "cracker",
+
+    # Hardware / smartphones / electrónica de consumo
+    "smartphone", "smartphones", "celular", "iphone", "android",
+    "procesador", "processor", "chip", "chips", "cpu", "gpu",
+    "tarjeta grafica", "graphics card", "periferico", "peripheral",
+    "teclado", "keyboard", "mouse", "auriculares", "headphones",
+    "earbuds", "smart tv", "televisor", "tv", "tablet", "notebook",
+    "laptop", "smartwatch", "wearable", "consola", "console",
+    "placa de video", "motherboard", "placa madre", "bateria", "battery",
+    "grafeno", "graphene", "semiconductor", "semiconductores", "chipset",
+    "pantalla", "display", "screen", "camara", "camera", "sensor",
+    "carga rapida", "fast charging", "usb-c", "bluetooth", "5g", "6g",
+    "wifi", "wi-fi", "router",
+
+    # Software y plataformas
+    "software", "app", "apps", "aplicacion", "application",
+    "sistema operativo", "operating system", "windows", "macos",
+    "linux", "ios", "actualizacion de software", "software update",
+    "beta", "codigo abierto", "open source", "api", "sdk",
+    "programacion", "programming", "desarrollador", "developer",
+
+    # Empresas / negocios tech
+    "google", "microsoft", "apple", "amazon", "meta", "facebook",
+    "instagram", "whatsapp", "samsung", "sony", "lg", "huawei",
+    "xiaomi", "oneplus", "motorola", "nvidia", "intel", "amd",
+    "qualcomm", "ibm", "oracle", "salesforce", "tesla", "spacex",
+    "twitter", "x corp", "tiktok", "startup", "startups",
+    "adquiere", "adquisicion", "acquisition", "fusion", "merger",
+    "ronda de inversion", "funding round", "invierte en", "invests in",
+    "ronda de financiamiento", "ipo", "salida a bolsa",
+
+    # Gaming
+    "videojuego", "videojuegos", "videogame", "videogames", "gaming",
+    "gamer", "nintendo", "playstation", "ps5", "ps6", "xbox",
+    "steam", "epic games", "esports", "e-sports", "esport",
+    "switch", "game pass", "unreal engine", "unity",
+
+    # Vehículos / movilidad
+    "auto electrico", "vehiculo electrico", "electric vehicle", "ev",
+    "coche electrico", "auto autonomo", "vehiculo autonomo",
+    "self-driving", "autonomous vehicle", "tesla", "moto electrica",
+    "carga rapida", "autopilot", "conduccion autonoma", "robotaxi",
+
+    # Realidad aumentada / virtual
+    "realidad aumentada", "augmented reality", "ar", "realidad virtual",
+    "virtual reality", "vr", "metaverso", "metaverse", "gafas de ra",
+    "gafas de rv", "vision pro", "quest", "lentes inteligentes",
+    "smart glasses", "xr", "mixed reality", "realidad mixta",
+
+    # Cripto / blockchain
+    "criptomoneda", "criptomonedas", "cryptocurrency", "crypto",
+    "bitcoin", "ethereum", "blockchain", "stablecoin", "web3",
+    "nft", "defi", "billetera cripto", "crypto wallet", "exchange cripto",
+
+    # Ciencia / espacio
+    "nasa", "espacio", "space", "cientificos", "scientists",
+    "estudio cientifico", "scientific study", "investigacion cientifica",
+    "fisica cuantica", "quantum physics", "computacion cuantica",
+    "quantum computing", "astronomia", "astronomy", "cohete", "rocket",
+    "spacex", "descubrimiento cientifico", "scientific discovery",
+    "mision espacial", "space mission", "satelite", "satellite",
+    "telescopio", "telescope", "marte", "mars", "luna", "moon",
+
+    # Hogar inteligente / IoT
+    "smart home", "hogar inteligente", "domotica", "iot",
+    "internet de las cosas", "internet of things", "electrodomestico",
+    "electrodomesticos", "aspiradora robot", "robot aspirador",
+    "asistente de voz", "voice assistant", "amazon echo", "alexa",
+    "google home", "google assistant", "siri",
+
+    # Cloud / infraestructura
+    "nube", "cloud", "cloud computing", "computacion en la nube",
+    "data center", "centro de datos", "servidor", "server",
+    "almacenamiento", "storage", "streaming",
 ]
 
 STOPWORDS_ES = {
