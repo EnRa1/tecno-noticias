@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.7 - 5 items/corrida + cap con relleno
-+ historial de categorias para diversidad tematica + dedup tematico manejado por IA)
+Pipeline de automatizacion para tecno.ar (Hybrid 4.8 - 5 items/corrida + cap con relleno
++ historial de categorias para diversidad tematica + dedup tematico manejado por IA
++ manejo robusto de errores por item)
 ==================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry, modelo 2.5-flash) -> devuelve
@@ -20,6 +21,10 @@ Pipeline de automatizacion para tecno.ar (Hybrid 4.7 - 5 items/corrida + cap con
 6. Redaccion con Gemini + VALIDACION PROGRAMATICA (no depende de autoevaluacion
    del modelo): detecta repeticion de palabras en titulo/H1 en Python puro y
    pide correccion especifica con reintentos si encuentra problemas
+
+Cada item se procesa dentro de un try/except individual en main(), de forma que
+un fallo en cualquier etapa (triangulacion, extraccion, imagen, redaccion) para
+UNA sola noticia no interrumpe el procesamiento del resto de la corrida.
 """
 
 import feedparser
@@ -51,7 +56,7 @@ TEMAS_RECIENTES_FILE = BASE_DIR / "temas_recientes.json"
 
 MAX_TITULOS_RECIENTES = 15
 MAX_CATEGORIAS_RECIENTES = 20  # ventana de "memoria" para el desempate por diversidad
-MAX_TEMAS_RECIENTES = 15       # ventana de "memoria" para dedup tematico (misma hecho)
+MAX_TEMAS_RECIENTES = 15       # ventana de "memoria" para dedup tematico (mismo hecho)
 MAX_REINTENTOS_TITULO = 2
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -132,7 +137,7 @@ REQUEST_HEADERS = {
 }
 
 KEYWORDS = [
-    # Términos generales de tecnología
+    # Terminos generales de tecnologia
     "tecnologia", "technology", "tech", "innovacion", "innovation",
     "gadget", "gadgets", "digital", "electronica", "electronics",
     "dispositivo", "device", "actualizacion", "update", "firmware",
@@ -160,7 +165,7 @@ KEYWORDS = [
     "authentication", "contraseña", "password", "botnet", "ddos",
     "troyano", "trojan", "spoofing", "cracker",
 
-    # Hardware / smartphones / electrónica de consumo
+    # Hardware / smartphones / electronica de consumo
     "smartphone", "smartphones", "celular", "iphone", "android",
     "procesador", "processor", "chip", "chips", "cpu", "gpu",
     "tarjeta grafica", "graphics card", "periferico", "peripheral",
@@ -196,7 +201,7 @@ KEYWORDS = [
     "steam", "epic games", "esports", "e-sports", "esport",
     "switch", "game pass", "unreal engine", "unity",
 
-    # Vehículos / movilidad
+    # Vehiculos / movilidad
     "auto electrico", "vehiculo electrico", "electric vehicle", "ev",
     "coche electrico", "auto autonomo", "vehiculo autonomo",
     "self-driving", "autonomous vehicle", "tesla", "moto electrica",
@@ -1042,23 +1047,46 @@ def _fetch_html(url, timeout=15):
     return resp.text
 
 def _extract_with_trafilatura(html, url):
-    text = trafilatura.extract(
-        html,
-        url=url,
-        favor_precision=True,
-        include_comments=False,
-        include_tables=False,
-    )
-    if text and len(text) >= 200:
+    """
+    Extrae texto y metadata con trafilatura. Blindado con try/except propio
+    porque trafilatura.extract_metadata() puede fallar internamente en
+    lxml/htmldate (ej. lxml.etree.SerialisationError: IO_ENCODER) con
+    ciertas paginas de estructura o encoding problematico. Si la extraccion
+    de TEXTO funciono pero la de METADATA falla, igual devolvemos el texto
+    con metadata vacia en vez de perder el articulo completo. Si extract()
+    en si mismo falla, devolvemos None para que el caller pruebe con
+    readability como fallback.
+    """
+    try:
+        text = trafilatura.extract(
+            html,
+            url=url,
+            favor_precision=True,
+            include_comments=False,
+            include_tables=False,
+        )
+    except Exception as e:
+        print(f"  ⚠️ Trafilatura.extract() falló ({type(e).__name__}: {e}), "
+              f"se prueba con readability.")
+        return None
+
+    if not text or len(text) < 200:
+        return None
+
+    try:
         metadata = trafilatura.extract_metadata(html, default_url=url)
-        return {
-            "title": metadata.title if metadata else "",
-            "text": text,
-            "authors": [metadata.author] if metadata and metadata.author else [],
-            "publish_date": metadata.date if metadata else None,
-            "top_image": metadata.image if metadata else None,
-        }
-    return None
+    except Exception as e:
+        print(f"  ⚠️ Trafilatura extrajo el texto pero extract_metadata() falló "
+              f"({type(e).__name__}: {e}), se continúa con metadata vacía.")
+        metadata = None
+
+    return {
+        "title": metadata.title if metadata else "",
+        "text": text,
+        "authors": [metadata.author] if metadata and metadata.author else [],
+        "publish_date": metadata.date if metadata else None,
+        "top_image": metadata.image if metadata else None,
+    }
 
 def _extract_with_readability(html, url):
     try:
@@ -1737,7 +1765,7 @@ El cuerpo de la nota en Markdown (600-900 palabras):
      directamente al keyword.
    - El keyword debe aparecer como STRING EXACTO dentro de una oracion que
      se lea 100% natural al leerla en voz alta.
-   - El keyword debe tener una densidad dentro del cuerpo de %1,5.
+   - El keyword debe tener una densidad dentro del cuerpo de aproximadamente %1,3.
 
 2. SUBTITULOS (H2) — EL KEYWORD DEBE ESTAR PRESENTE:
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
@@ -1851,8 +1879,9 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.7 (5 items/corrida + cap con relleno "
-          "+ diversidad de categorias + dedup tematico por IA)...")
+    print("🚀 Iniciando pipeline Hybrid 4.8 (5 items/corrida + cap con relleno "
+          "+ diversidad de categorias + dedup tematico por IA + manejo robusto "
+          "de errores por item)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
     print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación + ranking) = {GEMINI_GROUNDING_MODEL}")
@@ -1874,38 +1903,47 @@ def main():
         print(f"\n{'='*60}")
         print(f"📄 Procesando: {item['title'][:70]}...")
 
-        # 1. Triangulacion: grounding de Gemini primero (el modelo busca y evalua)
-        print("🔎 Ejecutando triangulación con grounding de Gemini...")
-        fuentes_adicionales = buscar_fuentes_con_grounding(item)
+        # Todo el procesamiento de este item vive dentro de un unico
+        # try/except: si falla cualquier etapa (triangulacion, extraccion
+        # de fuentes, extraccion del articulo principal, busqueda de
+        # imagen, redaccion o validacion), se descarta SOLO esta noticia
+        # y el pipeline sigue con la siguiente. Antes, un fallo en la
+        # extraccion del articulo principal (ej. error de trafilatura/lxml
+        # al buscar metadata) quedaba fuera de este bloque y tumbaba toda
+        # la corrida, perdiendo tambien los borradores de items anteriores
+        # que todavia no se habian subido a WordPress.
+        try:
+            # 1. Triangulacion: grounding de Gemini primero (el modelo busca y evalua)
+            print("🔎 Ejecutando triangulación con grounding de Gemini...")
+            fuentes_adicionales = buscar_fuentes_con_grounding(item)
 
-        if fuentes_adicionales is None:
-            print("🔎 Grounding falló técnicamente, usando cascada de respaldo...")
-            fuentes_adicionales = buscar_fuentes_cascada_respaldo(item, todos_los_candidatos)
+            if fuentes_adicionales is None:
+                print("🔎 Grounding falló técnicamente, usando cascada de respaldo...")
+                fuentes_adicionales = buscar_fuentes_cascada_respaldo(item, todos_los_candidatos)
 
-        # 2. Extraer el texto completo de cada fuente adicional encontrada
-        for f in fuentes_adicionales:
-            print(f"📥 Extrayendo fuente adicional: {f['source']}...")
-            full_sec = extract_full_article(f["link"])
-            f["texto_completo"] = (
-                full_sec["text"] if full_sec and full_sec.get("text")
-                else f.get("summary", "")
+            # 2. Extraer el texto completo de cada fuente adicional encontrada
+            for f in fuentes_adicionales:
+                print(f"📥 Extrayendo fuente adicional: {f['source']}...")
+                full_sec = extract_full_article(f["link"])
+                f["texto_completo"] = (
+                    full_sec["text"] if full_sec and full_sec.get("text")
+                    else f.get("summary", "")
+                )
+
+            # 3. Extraer articulo principal
+            print("📥 Extrayendo fuente principal...")
+            full_article = extract_full_article(item['link'])
+            contenido_principal = (
+                full_article['text'] if full_article and full_article.get('text')
+                else item['summary']
             )
 
-        # 3. Extraer articulo principal
-        print("📥 Extrayendo fuente principal...")
-        full_article = extract_full_article(item['link'])
-        contenido_principal = (
-            full_article['text'] if full_article and full_article.get('text')
-            else item['summary']
-        )
+            # 4. Buscar imagen relevante con Google Custom Search
+            print("🖼️ Buscando imagen relevante...")
+            fallback_image = full_article.get('top_image') if full_article else None
+            imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
 
-        # 4. Buscar imagen relevante con Google Custom Search
-        print("🖼️ Buscando imagen relevante...")
-        fallback_image = full_article.get('top_image') if full_article else None
-        imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
-
-        # 5. Redactar con Gemini + validacion programatica con reintentos
-        try:
+            # 5. Redactar con Gemini + validacion programatica con reintentos
             titulos_recientes = load_titulos_recientes()
 
             prompt = build_prompt(
@@ -1937,7 +1975,7 @@ def main():
             print(f"🧩 Tema registrado en historial de dedup: {item['title'][:60]}")
 
         except Exception as e:
-            print(f"[ERROR] No se pudo procesar '{item['title']}': {e}")
+            print(f"[ERROR] No se pudo procesar '{item['title']}': {type(e).__name__}: {e}")
 
         time.sleep(6)
 
