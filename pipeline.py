@@ -14,8 +14,11 @@ Pipeline de automatizacion para tecno.ar (Hybrid 4.8 - 5 items/corrida + cap con
    publicados y la propia lista a evaluar, para descartar duplicados tematicos
    (mismo hecho cubierto por medios distintos) directamente en el criterio del modelo,
    sin depender de similitud de texto en Python.
-3. Triangulacion de fuentes: grounding de Gemini (modelo fijo 2.5-flash) como
-   metodo principal; cascada de Custom Search con filtro de relevancia como respaldo
+3. Triangulacion de fuentes: busqueda directa con Google Custom Search (web
+   abierta sin restriccion de sitio primero, despues sitios de referencia,
+   despues pool de RSS local) como metodo PRINCIPAL; el grounding de Gemini
+   (modelo fijo 2.5-flash) queda como ULTIMO RECURSO, solo si ningun metodo
+   de busqueda directa encontro nada.
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
 5. Busqueda de imagen relevante via Google Custom Search API
 6. Redaccion con Gemini + VALIDACION PROGRAMATICA (no depende de autoevaluacion
@@ -25,6 +28,15 @@ Pipeline de automatizacion para tecno.ar (Hybrid 4.8 - 5 items/corrida + cap con
 Cada item se procesa dentro de un try/except individual en main(), de forma que
 un fallo en cualquier etapa (triangulacion, extraccion, imagen, redaccion) para
 UNA sola noticia no interrumpe el procesamiento del resto de la corrida.
+
+NOTA SOBRE RATE LIMITS: ademas del backoff reactivo que ya existia ante
+errores 429/5xx, se agregaron esperas PROACTIVAS antes de cada llamada a la
+API de Gemini y antes de cada llamada a Google Custom Search, mas esperas
+entre los pasos sucesivos de la cascada de triangulacion, entre la
+extraccion de cada fuente adicional, y entre el procesamiento de cada item.
+El objetivo es espaciar las llamadas salientes para reducir al maximo la
+probabilidad de pegar contra un limite de cuota, no solo reaccionar cuando
+ya ocurrio.
 """
 
 import feedparser
@@ -82,6 +94,19 @@ MAX_HOURS_OLD = 12
 DELAY_ENTRE_FASES = 15
 GEMINI_MAX_RETRIES = 4
 GEMINI_BASE_BACKOFF = 8
+
+# ----------------------------------------------------------------------
+# ESPERAS PROACTIVAS ANTI RATE-LIMIT
+# ----------------------------------------------------------------------
+# Estas esperas se suman ADEMAS del backoff reactivo que ya existe ante
+# errores 429/5xx (GEMINI_BASE_BACKOFF, SEARCH_BASE_BACKOFF). La idea es
+# espaciar las llamadas de salida ANTES de que ocurra cualquier error, para
+# reducir al maximo la probabilidad de pegar contra un limite de cuota.
+GEMINI_CALL_DELAY = 5           # espera antes de CADA llamada a la API de Gemini
+SEARCH_CALL_DELAY = 2           # espera antes de CADA llamada a Google Custom Search
+DELAY_ENTRE_PASOS_CASCADA = 3   # espera entre pasos sucesivos de la cascada de triangulacion
+DELAY_ENTRE_FUENTES_EXTRA = 2   # espera entre la extraccion de cada fuente adicional
+DELAY_ENTRE_ITEMS = 12          # espera entre el procesamiento de cada item (antes: 6s)
 
 # Cuantos indices priorizados le pedimos a Gemini en el ranking contextual.
 # Tiene que ser MAYOR a MAX_ITEMS_PER_RUN para que, si el cap por fuente
@@ -219,7 +244,7 @@ KEYWORDS = [
     "nft", "defi", "billetera cripto", "crypto wallet", "exchange cripto",
 
     # Ciencia / espacio
-    "nasa", "espacio", "space", "cientificos", "scientists",
+    "nasa", "espacio", "cientificos", "scientists",
     "estudio cientifico", "scientific study", "investigacion cientifica",
     "fisica cuantica", "quantum physics", "computacion cuantica",
     "quantum computing", "astronomia", "astronomy", "cohete", "rocket",
@@ -415,6 +440,7 @@ def _resolver_url_real(url_redirect, timeout=10):
     return url_redirect
 
 def _google_search_con_reintentos(params, contexto=""):
+    time.sleep(SEARCH_CALL_DELAY)
     for intento in range(SEARCH_MAX_RETRIES + 1):
         try:
             resp = requests.get(GOOGLE_SEARCH_URL, params=params, timeout=15)
@@ -748,13 +774,17 @@ def compute_relevance_score(entry_text):
     return max(0, min(10, score)), (categorias[0] if categorias else "general")
 
 # ----------------------------------------------------------------------
-# TRIANGULACION - METODO PRINCIPAL: GROUNDING CON GOOGLE SEARCH DE GEMINI
+# TRIANGULACION - ULTIMO RECURSO: GROUNDING CON GOOGLE SEARCH DE GEMINI
+# (se prueba solo si la busqueda directa con Google Custom Search, mas
+# abajo, no encontro nada; es el metodo mas costoso en cuota y el mas
+# propenso a rate limit, asi que queda al final de la cascada)
 # ----------------------------------------------------------------------
 
 def call_gemini_grounding_api(payload, context="grounding", retries=GEMINI_MAX_RETRIES):
     if not GEMINI_API_KEY:
         raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY")
 
+    time.sleep(GEMINI_CALL_DELAY)
     last_error = None
 
     for attempt in range(retries):
@@ -873,7 +903,8 @@ Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
         return None
 
 # ----------------------------------------------------------------------
-# TRIANGULACION - RESPALDO: CASCADA DE CUSTOM SEARCH + POOL DE RSS
+# TRIANGULACION - METODO PRINCIPAL: BUSQUEDA DIRECTA CON CUSTOM SEARCH
+# (web abierta primero, sitios de referencia despues, pool de RSS al final)
 # ----------------------------------------------------------------------
 
 def encontrar_fuente_secundaria(item_principal, todos_los_candidatos):
@@ -953,43 +984,85 @@ def _ejecutar_busqueda_texto(query, date_restrict, dominio_origen, max_fuentes, 
 
     return fuentes
 
-def buscar_fuentes_cascada_respaldo(item, todos_los_candidatos, max_fuentes=MAX_FUENTES_ADICIONALES):
-    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
-        print("    ⚠️ Sin credenciales de Google Search, saltando cascada de respaldo.")
-        fuente_rss = encontrar_fuente_secundaria(item, todos_los_candidatos)
-        return [fuente_rss] if fuente_rss else []
+def buscar_fuentes_busqueda_directa(item, todos_los_candidatos, max_fuentes=MAX_FUENTES_ADICIONALES):
+    """
+    Metodos de triangulacion basados en Google Custom Search (deterministicos,
+    no dependen de que un modelo de IA interprete o busque nada), probados en
+    ESTE ORDEN:
 
+    1. Web abierta, SIN restriccion de sitio (maxima cobertura posible de
+       toda la web, no solo un listado fijo de medios).
+    2. Sitios de referencia, ultimas 24hs.
+    3. Sitios de referencia, ultimas 72hs.
+    4. Pool de RSS local (similitud de texto, sin llamar a ninguna API externa).
+
+    Se prueban en este orden, y ANTES que el grounding de Gemini, porque son
+    mas baratos y estables en cuota. El grounding de Gemini queda como
+    ultimo recurso (ver buscar_fuentes_triangulacion).
+    """
     query_base = " ".join(item["title"].split()[:10])
     dominio_origen = _extraer_dominio(item["link"])
-    filtro_sitios = " OR ".join(f"site:{s}" for s in SITIOS_REFERENCIA_BUSQUEDA)
     titulo_original = item["title"]
 
-    print("    [Respaldo 1] Sitios de referencia, últimas 24hs...")
-    query_n1 = f"({filtro_sitios}) {query_base}"
-    fuentes = _ejecutar_busqueda_texto(query_n1, "d1", dominio_origen, max_fuentes, titulo_original)
-    if fuentes:
-        print(f"    ✅ Respaldo 1 exitoso: {', '.join(f['source'] for f in fuentes)}")
-        return fuentes
+    if GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID:
+        print("    [Método 1] Web abierta (sin restricción de sitio), últimas 48hs...")
+        fuentes = _ejecutar_busqueda_texto(query_base, "d2", dominio_origen, max_fuentes, titulo_original)
+        if fuentes:
+            print(f"    ✅ Método 1 exitoso: {', '.join(f['source'] for f in fuentes)}")
+            return fuentes
+        time.sleep(DELAY_ENTRE_PASOS_CASCADA)
 
-    print("    [Respaldo 2] Sitios de referencia, últimas 72hs...")
-    fuentes = _ejecutar_busqueda_texto(query_n1, "d3", dominio_origen, max_fuentes, titulo_original)
-    if fuentes:
-        print(f"    ✅ Respaldo 2 exitoso: {', '.join(f['source'] for f in fuentes)}")
-        return fuentes
+        filtro_sitios = " OR ".join(f"site:{s}" for s in SITIOS_REFERENCIA_BUSQUEDA)
+        query_sitios = f"({filtro_sitios}) {query_base}"
 
-    print("    [Respaldo 3] Web abierta (sin restricción de sitio), últimas 48hs...")
-    fuentes = _ejecutar_busqueda_texto(query_base, "d2", dominio_origen, max_fuentes, titulo_original)
-    if fuentes:
-        print(f"    ✅ Respaldo 3 exitoso: {', '.join(f['source'] for f in fuentes)}")
-        return fuentes
+        print("    [Método 2] Sitios de referencia, últimas 24hs...")
+        fuentes = _ejecutar_busqueda_texto(query_sitios, "d1", dominio_origen, max_fuentes, titulo_original)
+        if fuentes:
+            print(f"    ✅ Método 2 exitoso: {', '.join(f['source'] for f in fuentes)}")
+            return fuentes
+        time.sleep(DELAY_ENTRE_PASOS_CASCADA)
 
-    print("    [Respaldo 4] Pool de RSS local...")
+        print("    [Método 3] Sitios de referencia, últimas 72hs...")
+        fuentes = _ejecutar_busqueda_texto(query_sitios, "d3", dominio_origen, max_fuentes, titulo_original)
+        if fuentes:
+            print(f"    ✅ Método 3 exitoso: {', '.join(f['source'] for f in fuentes)}")
+            return fuentes
+        time.sleep(DELAY_ENTRE_PASOS_CASCADA)
+    else:
+        print("    ⚠️ Sin credenciales de Google Search, saltando métodos 1-3.")
+
+    print("    [Método 4] Pool de RSS local...")
     fuente_rss = encontrar_fuente_secundaria(item, todos_los_candidatos)
     if fuente_rss:
-        print(f"    ✅ Respaldo 4 exitoso: {fuente_rss['source']}")
+        print(f"    ✅ Método 4 exitoso: {fuente_rss['source']}")
         return [fuente_rss]
 
-    print("    ℹ️ Cascada de respaldo completa sin resultados.")
+    print("    ℹ️ Búsqueda directa sin resultados en ningún método.")
+    return []
+
+
+def buscar_fuentes_triangulacion(item, todos_los_candidatos, max_fuentes=MAX_FUENTES_ADICIONALES):
+    """
+    Orquesta la triangulacion completa de fuentes adicionales para un item:
+
+    1. Primero prueba TODOS los metodos de busqueda directa via Google
+       Custom Search (web abierta -> sitios de referencia -> pool de RSS),
+       que son mas rapidos y tienen cuota mas holgada.
+    2. Solo si NINGUNO de esos metodos encontro nada, recurre como ULTIMO
+       RECURSO al grounding de Gemini con Google Search integrado, que es
+       mas lento y el que mas riesgo de rate limit tiene.
+    """
+    fuentes = buscar_fuentes_busqueda_directa(item, todos_los_candidatos, max_fuentes=max_fuentes)
+    if fuentes:
+        return fuentes
+
+    time.sleep(DELAY_ENTRE_PASOS_CASCADA)
+    print("    [Método 5 - último recurso] Grounding de Gemini con Google Search...")
+    fuentes_grounding = buscar_fuentes_con_grounding(item, max_fuentes=max_fuentes)
+    if fuentes_grounding:
+        return fuentes_grounding
+
+    print("    ℹ️ Ningún método de triangulación (directo ni grounding) encontró fuentes.")
     return []
 
 # ----------------------------------------------------------------------
@@ -1140,6 +1213,7 @@ def call_gemini_api(payload, context="gemini", retries=GEMINI_MAX_RETRIES, url=N
         raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY")
 
     url = url or GEMINI_URL
+    time.sleep(GEMINI_CALL_DELAY)
     last_error = None
 
     for attempt in range(retries):
@@ -1879,18 +1953,23 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.8 (5 items/corrida + cap con relleno "
+    print("🚀 Iniciando pipeline Hybrid 4.9 (5 items/corrida + cap con relleno "
           "+ diversidad de categorias + dedup tematico por IA + manejo robusto "
-          "de errores por item)...")
+          "de errores por item + busqueda directa primero / grounding como "
+          "ultimo recurso + esperas anti rate-limit)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
-    print(f"DEBUG: GEMINI_GROUNDING_MODEL (triangulación + ranking) = {GEMINI_GROUNDING_MODEL}")
+    print(f"DEBUG: GEMINI_GROUNDING_MODEL (grounding último recurso + ranking) = {GEMINI_GROUNDING_MODEL}")
     print(f"DEBUG: MAX_ITEMS_PER_RUN = {MAX_ITEMS_PER_RUN} | RANKING_POOL_SIZE = {RANKING_POOL_SIZE} "
           f"| MAX_POR_FUENTE = {MAX_POR_FUENTE}")
     print(f"DEBUG: MAX_CATEGORIAS_RECIENTES (ventana de diversidad) = {MAX_CATEGORIAS_RECIENTES}")
     print(f"DEBUG: MAX_TEMAS_RECIENTES (ventana de dedup tematico) = {MAX_TEMAS_RECIENTES}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
     print(f"DEBUG: GOOGLE_SEARCH_ENGINE_ID {'OK' if GOOGLE_SEARCH_ENGINE_ID else 'FALTA'}")
+    print(f"DEBUG: GEMINI_CALL_DELAY = {GEMINI_CALL_DELAY}s | SEARCH_CALL_DELAY = {SEARCH_CALL_DELAY}s | "
+          f"DELAY_ENTRE_PASOS_CASCADA = {DELAY_ENTRE_PASOS_CASCADA}s | "
+          f"DELAY_ENTRE_FUENTES_EXTRA = {DELAY_ENTRE_FUENTES_EXTRA}s | "
+          f"DELAY_ENTRE_ITEMS = {DELAY_ENTRE_ITEMS}s")
 
     items, todos_los_candidatos = fetch_new_relevant_items()
     print(f"Encontrados {len(items)} items nuevos para procesar.")
@@ -1913,16 +1992,17 @@ def main():
         # la corrida, perdiendo tambien los borradores de items anteriores
         # que todavia no se habian subido a WordPress.
         try:
-            # 1. Triangulacion: grounding de Gemini primero (el modelo busca y evalua)
-            print("🔎 Ejecutando triangulación con grounding de Gemini...")
-            fuentes_adicionales = buscar_fuentes_con_grounding(item)
-
-            if fuentes_adicionales is None:
-                print("🔎 Grounding falló técnicamente, usando cascada de respaldo...")
-                fuentes_adicionales = buscar_fuentes_cascada_respaldo(item, todos_los_candidatos)
+            # 1. Triangulacion: busqueda directa con Google Custom Search primero
+            # (web abierta -> sitios de referencia -> pool de RSS); el grounding
+            # de Gemini queda como ultimo recurso, solo si nada de eso encontro fuentes.
+            print("🔎 Ejecutando triangulación (búsqueda directa primero, "
+                  "grounding de Gemini como último recurso)...")
+            fuentes_adicionales = buscar_fuentes_triangulacion(item, todos_los_candidatos)
 
             # 2. Extraer el texto completo de cada fuente adicional encontrada
-            for f in fuentes_adicionales:
+            for idx_f, f in enumerate(fuentes_adicionales):
+                if idx_f > 0:
+                    time.sleep(DELAY_ENTRE_FUENTES_EXTRA)
                 print(f"📥 Extrayendo fuente adicional: {f['source']}...")
                 full_sec = extract_full_article(f["link"])
                 f["texto_completo"] = (
@@ -1977,7 +2057,7 @@ def main():
         except Exception as e:
             print(f"[ERROR] No se pudo procesar '{item['title']}': {type(e).__name__}: {e}")
 
-        time.sleep(6)
+        time.sleep(DELAY_ENTRE_ITEMS)
 
     print("\n✅ Pipeline finalizado.")
 
