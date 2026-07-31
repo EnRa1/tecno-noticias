@@ -14,11 +14,13 @@ Pipeline de automatizacion para tecno.ar (Hybrid 4.8 - 5 items/corrida + cap con
    publicados y la propia lista a evaluar, para descartar duplicados tematicos
    (mismo hecho cubierto por medios distintos) directamente en el criterio del modelo,
    sin depender de similitud de texto en Python.
-3. Triangulacion de fuentes: busqueda directa con Google Custom Search (web
-   abierta sin restriccion de sitio primero, despues sitios de referencia,
-   despues pool de RSS local) como metodo PRINCIPAL; el grounding de Gemini
-   (modelo fijo 2.5-flash) queda como ULTIMO RECURSO, solo si ningun metodo
-   de busqueda directa encontro nada.
+3. Triangulacion de fuentes: el grounding de Gemini con Google Search, restringido a
+   UNA SOLA fuente de MAXIMA AUTORIDAD (ver FUENTES_MAXIMA_AUTORIDAD), es el metodo
+   PRIORITARIO por su precision semantica; si no encuentra nada dentro de esa
+   whitelist chica (para no gastar tokens de mas), cae como RESPALDO a la busqueda
+   directa deterministica con Google Custom Search (web abierta sin restriccion de
+   sitio primero, despues sitios de referencia, despues pool de RSS local), que no
+   consume tokens de Gemini.
 4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
 5. Busqueda de imagen relevante via Google Custom Search API
 6. Redaccion con Gemini + VALIDACION PROGRAMATICA (no depende de autoevaluacion
@@ -114,9 +116,30 @@ DELAY_ENTRE_ITEMS = 12          # espera entre el procesamiento de cada item (an
 # para llenar ese lugar en vez de publicar menos de MAX_ITEMS_PER_RUN.
 RANKING_POOL_SIZE = MAX_ITEMS_PER_RUN + 5
 
-MAX_FUENTES_ADICIONALES = 2
+MAX_FUENTES_ADICIONALES = 1  # 1 sola fuente externa de máxima autoridad, además de la oficial.
 SEARCH_MAX_RETRIES = 2
 SEARCH_BASE_BACKOFF = 3
+
+# Medios a los que se restringe el grounding de Gemini cuando actúa como
+# metodo PRIORITARIO. Son fuentes de maxima autoridad, no el listado amplio
+# de SITIOS_REFERENCIA_BUSQUEDA (ese se sigue usando solo en la cascada de
+# respaldo con Custom Search).
+FUENTES_MAXIMA_AUTORIDAD = [
+    "reuters.com",
+    "apnews.com",
+    "bloomberg.com",
+    "nytimes.com",
+    "techcrunch.com",
+    "theverge.com",
+    "wired.com",
+    "arstechnica.com",
+    "bleepingcomputer.com",
+    "thehackernews.com",
+    "krebsonsecurity.com",
+    "infobae.com",
+    "clarin.com",
+    "ambito.com",
+]
 
 SIMILITUD_MINIMA = 0.18
 UMBRAL_RELEVANCIA_CASCADA = 0.12
@@ -774,10 +797,11 @@ def compute_relevance_score(entry_text):
     return max(0, min(10, score)), (categorias[0] if categorias else "general")
 
 # ----------------------------------------------------------------------
-# TRIANGULACION - ULTIMO RECURSO: GROUNDING CON GOOGLE SEARCH DE GEMINI
-# (se prueba solo si la busqueda directa con Google Custom Search, mas
-# abajo, no encontro nada; es el metodo mas costoso en cuota y el mas
-# propenso a rate limit, asi que queda al final de la cascada)
+# TRIANGULACION - METODO PRIORITARIO: GROUNDING CON GOOGLE SEARCH DE GEMINI
+# Restringido a UNA SOLA fuente de MAXIMA AUTORIDAD para no gastar tokens
+# de mas (ver FUENTES_MAXIMA_AUTORIDAD). Si no encuentra nada dentro de esa
+# whitelist chica, se cae a la cascada de Custom Search como respaldo (ver
+# buscar_fuentes_triangulacion).
 # ----------------------------------------------------------------------
 
 def call_gemini_grounding_api(payload, context="grounding", retries=GEMINI_MAX_RETRIES):
@@ -822,22 +846,29 @@ def buscar_fuentes_con_grounding(item, max_fuentes=MAX_FUENTES_ADICIONALES):
         print("    ⚠️ Sin GEMINI_API_KEY, no se puede usar grounding.")
         return None
 
+    filtro_dominios = ", ".join(FUENTES_MAXIMA_AUTORIDAD)
+
     prompt = f"""
-Busca en la web noticias RECIENTES (ultimas 24-48 horas) que cubran el mismo
-hecho o tema que esta noticia:
+Busca en la web UNA SOLA noticia RECIENTE (ultimas 24-48 horas) que cubra el mismo
+hecho o tema que esta noticia, publicada por un medio de MAXIMA AUTORIDAD:
 
 Titulo: {item['title']}
 Resumen: {item['summary'][:300]}
 
-Encuentra hasta {max_fuentes} articulos de medios DISTINTOS a "{item['source']}"
-que hablen especificamente de este mismo evento (no articulos genericos sobre
-el tema general, sino cobertura del mismo hecho puntual).
+Restringi la busqueda EXCLUSIVAMENTE a estos dominios (si encontras cobertura
+en mas de uno, quedate con el de mas autoridad y mas especifico sobre el
+hecho puntual, no una nota generica sobre el tema general): {filtro_dominios}
 
-Devolveme SOLO un JSON con este formato exacto, sin texto adicional:
+El medio tiene que ser DISTINTO a "{item['source']}" y tiene que hablar
+especificamente de este mismo evento puntual.
+
+Devolveme SOLO un JSON con este formato exacto, sin texto adicional, con
+COMO MAXIMO 1 fuente:
 {{"fuentes": [{{"title": "titulo del articulo", "source": "nombre del medio",
 "link": "URL completa del articulo"}}]}}
 
-Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
+Si ninguno de esos dominios tiene cobertura de este hecho puntual, devolveme
+{{"fuentes": []}}. No inventes una fuente de un dominio fuera de la lista.
 """
 
     payload = {
@@ -847,8 +878,8 @@ Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
     }
 
     try:
-        print(f"    🔎 Buscando con grounding de Gemini ({GEMINI_GROUNDING_MODEL}): "
-              f"'{item['title'][:60]}...'")
+        print(f"    🔎 Grounding de Gemini ({GEMINI_GROUNDING_MODEL}) restringido a "
+              f"fuentes de máxima autoridad: '{item['title'][:60]}...'")
         data = call_gemini_grounding_api(payload, context="grounding-triangulacion")
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
 
@@ -877,6 +908,12 @@ Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
                 continue
             if any(excl in dominio for excl in DOMINIOS_EXCLUIDOS):
                 continue
+            # Blindaje en Python: aunque el prompt ya restringe el dominio,
+            # no confiamos ciegamente en que el modelo respete la instrucción.
+            if not any(autoridad in dominio for autoridad in FUENTES_MAXIMA_AUTORIDAD):
+                print(f"    ⏭️ Fuente descartada por no pertenecer a la whitelist "
+                      f"de máxima autoridad: {dominio}")
+                continue
 
             fuentes.append({
                 "hash": item_hash({"link": link}),
@@ -891,10 +928,10 @@ Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
                 break
 
         if fuentes:
-            print(f"    ✅ Grounding encontró {len(fuentes)} fuente(s): "
+            print(f"    ✅ Grounding encontró {len(fuentes)} fuente(s) de máxima autoridad: "
                   + ", ".join(f["source"] for f in fuentes))
         else:
-            print("    ℹ️ Grounding no encontró fuentes adicionales relevantes.")
+            print("    ℹ️ Grounding no encontró fuentes de máxima autoridad para este hecho.")
 
         return fuentes
 
@@ -903,7 +940,7 @@ Si no encontras ninguna fuente adicional relevante, devolveme {{"fuentes": []}}.
         return None
 
 # ----------------------------------------------------------------------
-# TRIANGULACION - METODO PRINCIPAL: BUSQUEDA DIRECTA CON CUSTOM SEARCH
+# TRIANGULACION - METODO DE RESPALDO: BUSQUEDA DIRECTA CON CUSTOM SEARCH
 # (web abierta primero, sitios de referencia despues, pool de RSS al final)
 # ----------------------------------------------------------------------
 
@@ -988,17 +1025,14 @@ def buscar_fuentes_busqueda_directa(item, todos_los_candidatos, max_fuentes=MAX_
     """
     Metodos de triangulacion basados en Google Custom Search (deterministicos,
     no dependen de que un modelo de IA interprete o busque nada), probados en
-    ESTE ORDEN:
+    ESTE ORDEN, y usados como RESPALDO solo si el grounding de Gemini (metodo
+    prioritario) no encontro nada dentro de su whitelist de maxima autoridad:
 
     1. Web abierta, SIN restriccion de sitio (maxima cobertura posible de
        toda la web, no solo un listado fijo de medios).
     2. Sitios de referencia, ultimas 24hs.
     3. Sitios de referencia, ultimas 72hs.
     4. Pool de RSS local (similitud de texto, sin llamar a ninguna API externa).
-
-    Se prueban en este orden, y ANTES que el grounding de Gemini, porque son
-    mas baratos y estables en cuota. El grounding de Gemini queda como
-    ultimo recurso (ver buscar_fuentes_triangulacion).
     """
     query_base = " ".join(item["title"].split()[:10])
     dominio_origen = _extraer_dominio(item["link"])
@@ -1045,24 +1079,29 @@ def buscar_fuentes_triangulacion(item, todos_los_candidatos, max_fuentes=MAX_FUE
     """
     Orquesta la triangulacion completa de fuentes adicionales para un item:
 
-    1. Primero prueba TODOS los metodos de busqueda directa via Google
-       Custom Search (web abierta -> sitios de referencia -> pool de RSS),
-       que son mas rapidos y tienen cuota mas holgada.
-    2. Solo si NINGUNO de esos metodos encontro nada, recurre como ULTIMO
-       RECURSO al grounding de Gemini con Google Search integrado, que es
-       mas lento y el que mas riesgo de rate limit tiene.
+    1. PRIMERO prueba el grounding de Gemini con Google Search, restringido
+       a 1 sola fuente de maxima autoridad (ver FUENTES_MAXIMA_AUTORIDAD).
+       Es el metodo semanticamente mas preciso para encontrar cobertura del
+       mismo hecho, pero tambien el que mas cuota de tokens de Gemini
+       consume, por eso queda limitado a 1 fuente y a una whitelist chica.
+    2. Solo si el grounding no encontro nada (o no hay API key), cae como
+       RESPALDO a la cascada deterministica con Google Custom Search (web
+       abierta -> sitios de referencia -> pool de RSS), que no consume
+       tokens de Gemini.
     """
-    fuentes = buscar_fuentes_busqueda_directa(item, todos_los_candidatos, max_fuentes=max_fuentes)
-    if fuentes:
-        return fuentes
-
-    time.sleep(DELAY_ENTRE_PASOS_CASCADA)
-    print("    [Método 5 - último recurso] Grounding de Gemini con Google Search...")
+    print("    [Método 1 - prioritario] Grounding de Gemini, 1 fuente de máxima autoridad...")
     fuentes_grounding = buscar_fuentes_con_grounding(item, max_fuentes=max_fuentes)
     if fuentes_grounding:
         return fuentes_grounding
 
-    print("    ℹ️ Ningún método de triangulación (directo ni grounding) encontró fuentes.")
+    time.sleep(DELAY_ENTRE_PASOS_CASCADA)
+    print("    [Método de respaldo] Grounding sin resultados, se prueba la cascada "
+          "de búsqueda directa con Google Custom Search...")
+    fuentes = buscar_fuentes_busqueda_directa(item, todos_los_candidatos, max_fuentes=max_fuentes)
+    if fuentes:
+        return fuentes
+
+    print("    ℹ️ Ningún método de triangulación (grounding ni búsqueda directa) encontró fuentes.")
     return []
 
 # ----------------------------------------------------------------------
@@ -1953,15 +1992,18 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.9 (5 items/corrida + cap con relleno "
+    print("🚀 Iniciando pipeline Hybrid 5.0 (5 items/corrida + cap con relleno "
           "+ diversidad de categorias + dedup tematico por IA + manejo robusto "
-          "de errores por item + busqueda directa primero / grounding como "
-          "ultimo recurso + esperas anti rate-limit)...")
+          "de errores por item + grounding con 1 fuente de maxima autoridad como "
+          "metodo prioritario / Custom Search como respaldo + esperas anti "
+          "rate-limit)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
-    print(f"DEBUG: GEMINI_GROUNDING_MODEL (grounding último recurso + ranking) = {GEMINI_GROUNDING_MODEL}")
+    print(f"DEBUG: GEMINI_GROUNDING_MODEL (grounding prioritario + ranking) = {GEMINI_GROUNDING_MODEL}")
     print(f"DEBUG: MAX_ITEMS_PER_RUN = {MAX_ITEMS_PER_RUN} | RANKING_POOL_SIZE = {RANKING_POOL_SIZE} "
           f"| MAX_POR_FUENTE = {MAX_POR_FUENTE}")
+    print(f"DEBUG: MAX_FUENTES_ADICIONALES = {MAX_FUENTES_ADICIONALES} "
+          f"| FUENTES_MAXIMA_AUTORIDAD = {len(FUENTES_MAXIMA_AUTORIDAD)} dominios")
     print(f"DEBUG: MAX_CATEGORIAS_RECIENTES (ventana de diversidad) = {MAX_CATEGORIAS_RECIENTES}")
     print(f"DEBUG: MAX_TEMAS_RECIENTES (ventana de dedup tematico) = {MAX_TEMAS_RECIENTES}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
@@ -1992,11 +2034,12 @@ def main():
         # la corrida, perdiendo tambien los borradores de items anteriores
         # que todavia no se habian subido a WordPress.
         try:
-            # 1. Triangulacion: busqueda directa con Google Custom Search primero
-            # (web abierta -> sitios de referencia -> pool de RSS); el grounding
-            # de Gemini queda como ultimo recurso, solo si nada de eso encontro fuentes.
-            print("🔎 Ejecutando triangulación (búsqueda directa primero, "
-                  "grounding de Gemini como último recurso)...")
+            # 1. Triangulacion: grounding de Gemini restringido a 1 fuente de
+            # maxima autoridad como metodo prioritario; si no encuentra nada,
+            # cae como respaldo a la busqueda directa con Google Custom Search
+            # (web abierta -> sitios de referencia -> pool de RSS).
+            print("🔎 Ejecutando triangulación (grounding de Gemini prioritario, "
+                  "Custom Search como respaldo)...")
             fuentes_adicionales = buscar_fuentes_triangulacion(item, todos_los_candidatos)
 
             # 2. Extraer el texto completo de cada fuente adicional encontrada
