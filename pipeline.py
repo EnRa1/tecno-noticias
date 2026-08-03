@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.8 - 5 items/corrida + cap con relleno
+Pipeline de automatizacion para tecno.ar (Hybrid 4.9 - 5 items/corrida + cap con relleno
 + historial de categorias para diversidad tematica + dedup tematico manejado por IA
-+ manejo robusto de errores por item)
++ manejo robusto de errores por item + cierre opcional de impacto en Argentina
++ señal de desempate por conexion local en el ranking)
 ==================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. Filtro contextual con Gemini (1 sola llamada, con retry, modelo 2.5-flash) -> devuelve
@@ -13,7 +14,9 @@ Pipeline de automatizacion para tecno.ar (Hybrid 4.8 - 5 items/corrida + cap con
    siempre en las mismas 1-2 categorias. Tambien recibe el HISTORIAL DE TEMAS ya
    publicados y la propia lista a evaluar, para descartar duplicados tematicos
    (mismo hecho cubierto por medios distintos) directamente en el criterio del modelo,
-   sin depender de similitud de texto en Python.
+   sin depender de similitud de texto en Python. Como señal ADICIONAL de desempate
+   (nunca como filtro duro ni como eje que reemplace el merito periodistico) se pondera
+   levemente una conexion local (Argentina/LatAm) real y concreta.
 3. Triangulacion de fuentes: el grounding de Gemini con Google Search, restringido a
    UNA SOLA fuente de MAXIMA AUTORIDAD (ver FUENTES_MAXIMA_AUTORIDAD), es el metodo
    PRIORITARIO por su precision semantica; si no encuentra nada dentro de esa
@@ -25,7 +28,11 @@ Pipeline de automatizacion para tecno.ar (Hybrid 4.8 - 5 items/corrida + cap con
 5. Busqueda de imagen relevante via Google Custom Search API
 6. Redaccion con Gemini + VALIDACION PROGRAMATICA (no depende de autoevaluacion
    del modelo): detecta repeticion de palabras en titulo/H1 en Python puro y
-   pide correccion especifica con reintentos si encuentra problemas
+   pide correccion especifica con reintentos si encuentra problemas. En la misma
+   llamada de redaccion (sin pasadas adicionales que gasten mas tokens de Gemini),
+   se le pide al modelo un cierre OPCIONAL de impacto en Argentina: solo se agrega
+   al articulo si el propio modelo encuentra una conexion real y concreta; si no,
+   se omite por completo en vez de forzarla.
 
 Cada item se procesa dentro de un try/except individual en main(), de forma que
 un fallo en cualquier etapa (triangulacion, extraccion, imagen, redaccion) para
@@ -1448,11 +1455,21 @@ comunes en 2026" (listicle genérico), "¿Podría Apple comprar Netflix?"
 ===========================================
 CÓMO DECIDIR ENTRE VARIAS NOTICIAS CON PUNTAJE SIMILAR
 ===========================================
-Si varias noticias quedan parejas tras aplicar los 4 ejes, priorizá la que
-tenga: (a) confirmación oficial más directa, (b) mayor impacto o alcance
-(más usuarios/empresas afectadas pesa más que un caso aislado), (c) mayor
-actualidad dentro de la ventana de tiempo. Esto aplica igual entre dos
-noticias de la misma categoría o de categorías distintas.
+Si varias noticias quedan parejas tras aplicar los 4 ejes, priorizá, EN ESTE
+ORDEN:
+(a) confirmación oficial más directa,
+(b) mayor impacto o alcance (más usuarios/empresas afectadas pesa más que
+    un caso aislado),
+(c) mayor actualidad dentro de la ventana de tiempo,
+(d) conexión real y concreta con Argentina o Latinoamérica (una empresa
+    local involucrada, un producto que se lanza o cambia de precio acá, una
+    regulación que aplica a la región, un impacto directo en el mercado
+    local) — esto es el ÚLTIMO desempate, solo entre noticias que ya
+    quedaron parejas en (a), (b) y (c). Una nota sin ninguna conexión local
+    NUNCA pierde terreno por eso: la ausencia de gancho argentino no resta
+    puntos, solo la presencia de uno real sirve para destrabar un empate.
+Esto aplica igual entre dos noticias de la misma categoría o de categorías
+distintas.
 
 ===========================================
 CONTEXTO DE DIVERSIDAD TEMATICA (criterio de DESEMPATE, no reemplaza los
@@ -1900,11 +1917,44 @@ El cuerpo de la nota en Markdown (600-900 palabras):
    {enlaces_instruccion}
 
 ===========================================
+PASO 3 (OPCIONAL): CIERRE DE IMPACTO EN ARGENTINA
+===========================================
+Esto NO es un requisito obligatorio en cada nota. Aplica el mismo estándar
+de un editor jefe exigente: solo se agrega esta sección si hay una conexión
+REAL, ESPECIFICA y VERIFICABLE con Argentina o la región, no una genérica.
+
+Conexión válida (ejemplos): la empresa opera o vende oficialmente en
+Argentina, el producto tiene fecha o precio de llegada al país, hay una
+regulación local que aplica directo al hecho, una empresa argentina o
+latinoamericana está involucrada, o el hecho afecta de forma directa y
+puntual a un mercado o industria local.
+
+Conexión INVALIDA (no la uses como excusa): frases genéricas del tipo "esto
+también podría eventualmente llegar a Argentina" o "los usuarios argentinos
+también usan esta tecnología" sin ningún dato concreto detrás. Si tenés que
+forzarla o especular para que cierre, la respuesta correcta es NO incluirla.
+
+Si encontrás una conexión real:
+- Escribí 2 a 4 oraciones concretas (con datos, no relleno) que puedan
+  agregarse como el H2 final del artículo, con el título "## Qué significa
+  para Argentina" (o una variación natural de ese título).
+- No inventes cifras, fechas de disponibilidad o declaraciones que no
+  surjan de la fuente principal o de las fuentes adicionales.
+
+Si NO encontrás una conexión real:
+- Escribí exactamente: N/A
+
+## IMPACTO_ARGENTINA
+[2 a 4 oraciones con la conexión real, listas para usarse como cierre del
+artículo, o bien el texto exacto "N/A" si no corresponde. No expliques tu
+razonamiento acá, solo el resultado.]
+
+===========================================
 FORMATO DE SALIDA
 ===========================================
 Devolveme EXCLUSIVAMENTE los campos de arriba (FOCUS_KEYWORD, SEO_TITLE, SLUG,
-META_DESCRIPTION, H1, ARTICULO, ALT_TEXT) con esos encabezados exactos en
-Markdown. No agregues explicaciones fuera de esa estructura.
+META_DESCRIPTION, H1, ARTICULO, IMPACTO_ARGENTINA) con esos encabezados exactos
+en Markdown. No agregues explicaciones fuera de esa estructura.
 Al final del ARTICULO, agrega: "Fuente: {fuentes_finales_str}"
 """
 
@@ -1966,6 +2016,61 @@ cambies el FOCUS_KEYWORD.
           f"se usa la ultima version generada de todos modos.")
     return article
 
+def aplicar_cierre_argentina(article_md):
+    """
+    Busca el campo opcional IMPACTO_ARGENTINA generado por Gemini dentro
+    del mismo llamado de redaccion (no gasta una llamada extra a la API).
+    Si el modelo encontro una conexion real y concreta, lo agrega como H2
+    final al cuerpo del ARTICULO. Si el campo vino vacio, "N/A" o
+    equivalente, no se agrega nada: la ausencia de gancho argentino NUNCA
+    se fuerza.
+
+    Devuelve el markdown completo (con el campo IMPACTO_ARGENTINA ya
+    removido del bloque de campos, para no duplicarlo en el borrador final).
+    """
+    impacto = extraer_campo(article_md, "IMPACTO_ARGENTINA")
+
+    # Removemos el campo IMPACTO_ARGENTINA del markdown de campos sin
+    # importar si se usa o no, porque es informacion de control interna,
+    # no un campo que tenga que llegar tal cual al borrador/WordPress.
+    article_sin_campo = re.sub(
+        r"\n## IMPACTO_ARGENTINA\s*\n.+?(?=\n##|\Z)", "", article_md, flags=re.DOTALL
+    )
+
+    if not impacto:
+        return article_sin_campo
+
+    texto_normalizado = impacto.strip().lower()
+    valores_vacios = {"n/a", "na", "no aplica", "ninguno", "ninguna", ""}
+    if texto_normalizado in valores_vacios or len(impacto.strip()) < 15:
+        return article_sin_campo
+
+    print("    🇦🇷 Se agrega cierre de impacto en Argentina (conexión real encontrada).")
+
+    match_articulo = re.search(r"(## ARTICULO\s*\n)(.+)", article_sin_campo, re.DOTALL)
+    if not match_articulo:
+        # Si por algun motivo no se pudo ubicar el campo ARTICULO, no
+        # arriesgamos a romper el formato: devolvemos el markdown intacto.
+        return article_sin_campo
+
+    cuerpo_articulo = match_articulo.group(2)
+
+    # El cuerpo del ARTICULO termina con la linea "Fuente: ...". Insertamos
+    # el H2 de cierre justo ANTES de esa linea, para que quede como la
+    # ultima seccion de contenido real del articulo.
+    if "\nFuente:" in cuerpo_articulo:
+        cuerpo_nuevo = cuerpo_articulo.replace(
+            "\nFuente:",
+            f"\n\n## Qué significa para Argentina\n\n{impacto.strip()}\n\nFuente:",
+            1,
+        )
+    else:
+        cuerpo_nuevo = cuerpo_articulo.rstrip() + \
+            f"\n\n## Qué significa para Argentina\n\n{impacto.strip()}\n"
+
+    inicio = article_sin_campo[:match_articulo.start(2)]
+    return inicio + cuerpo_nuevo
+
 # ----------------------------------------------------------------------
 # GUARDADO DE BORRADORES LOCALES
 # ----------------------------------------------------------------------
@@ -1992,11 +2097,11 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 5.0 (5 items/corrida + cap con relleno "
+    print("🚀 Iniciando pipeline Hybrid 4.9 (5 items/corrida + cap con relleno "
           "+ diversidad de categorias + dedup tematico por IA + manejo robusto "
           "de errores por item + grounding con 1 fuente de maxima autoridad como "
           "metodo prioritario / Custom Search como respaldo + esperas anti "
-          "rate-limit)...")
+          "rate-limit + cierre opcional de impacto en Argentina)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
     print(f"DEBUG: GEMINI_GROUNDING_MODEL (grounding prioritario + ranking) = {GEMINI_GROUNDING_MODEL}")
@@ -2066,7 +2171,10 @@ def main():
             fallback_image = full_article.get('top_image') if full_article else None
             imagen_url = buscar_imagen_google(item['title'], fallback_url=fallback_image)
 
-            # 5. Redactar con Gemini + validacion programatica con reintentos
+            # 5. Redactar con Gemini + validacion programatica con reintentos.
+            # El cierre opcional de impacto en Argentina se pide DENTRO de
+            # este mismo prompt (campo IMPACTO_ARGENTINA), sin agregar una
+            # llamada extra a Gemini.
             titulos_recientes = load_titulos_recientes()
 
             prompt = build_prompt(
@@ -2077,6 +2185,11 @@ def main():
                 titulos_recientes=titulos_recientes,
             )
             article = redactar_con_validacion(prompt, item)
+
+            # 6. Aplicar (o descartar) el cierre de impacto en Argentina
+            # segun lo que haya devuelto el propio modelo, sin forzar nada.
+            article = aplicar_cierre_argentina(article)
+
             save_draft(item, article, imagen_url=imagen_url)
 
             seo_title_generado = extraer_seo_title(article)
