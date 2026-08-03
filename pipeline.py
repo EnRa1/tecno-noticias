@@ -207,18 +207,6 @@ KEYWORDS = [
     "generative ai", "ia generativa", "agentic ai", "ia agentica",
     "computer vision", "vision artificial", "nlp", "procesamiento de lenguaje natural",
 
-    # Ciberseguridad
-    "ciberseguridad", "seguridad informatica", "cybersecurity",
-    "cyber security", "infosec", "hacker", "hackers", "hacking",
-    "hackeo", "hackearon", "vulnerabilidad", "vulnerabilidades",
-    "vulnerability", "vulnerabilities", "exploit", "zero-day", "zero day",
-    "ransomware", "malware", "spyware", "phishing", "cve",
-    "filtracion de datos", "data breach", "brecha de datos", "data leak",
-    "ciberataque", "ciberataques", "cyberattack", "hackeado",
-    "parche de seguridad", "security patch", "grupo de hackers",
-    "vpn", "firewall", "encriptacion", "encryption", "autenticacion",
-    "authentication", "contraseña", "password", "botnet", "ddos",
-    "troyano", "trojan", "spoofing", "cracker",
 
     # Hardware / smartphones / electronica de consumo
     "smartphone", "smartphones", "celular", "iphone", "android",
@@ -342,7 +330,7 @@ def guardar_titulo_reciente(seo_title):
 
 def load_categorias_recientes():
     """
-    Devuelve la lista de categorias (string, ej: 'ia', 'ciberseguridad',
+    Devuelve la lista de categorias (string, ej: 'ia',
     'gaming') de las ultimas notas publicadas, en orden cronologico
     (la mas vieja primero). Se usa como contexto de diversidad para el
     ranking de Gemini, no como filtro duro.
@@ -684,27 +672,6 @@ HOGAR_KEYWORDS = [
     "robot vacuum",
 ]
 
-CIBERSEGURIDAD_KEYWORDS = [
-    "ciberseguridad", "seguridad informatica", "vulnerabilidad", "vulnerabilidades",
-    "ransomware", "malware", "phishing", "exploit", "zero-day", "cve",
-    "filtracion de datos", "brecha de datos", "hackeo", "hackearon",
-    "ciberataque", "ciberataques", "parche de seguridad", "grupo de hackers",
-    # ingles
-    "cybersecurity", "cyber security", "infosec", "vulnerability",
-    "vulnerabilities", "zero day", "data breach", "data leak",
-    "cyberattack", "cyber attack", "security patch", "hacking group",
-    "spyware", "trojan", "botnet", "ddos", "spoofing", "encryption",
-]
-
-CIBERSEGURIDAD_EVENTO_KEYWORDS = [
-    "ataca", "ataco", "vulnera", "vulneraron", "expone", "expusieron",
-    "filtra", "filtraron", "hackea", "hackearon", "compromete",
-    "comprometieron", "parche disponible", "ya hay parche",
-    # ingles
-    "attacks", "attacked", "exposes", "exposed", "leaks", "leaked",
-    "hacks", "hacked", "compromises", "compromised", "patch available",
-    "patch released", "breached",
-]
 
 EMPRESAS_KEYWORDS = [
     "adquiere", "adquisicion", "fusion", "ronda de inversion", "invierte en",
@@ -760,11 +727,6 @@ def compute_relevance_score(entry_text):
             score += 2
         categorias.append("vehiculos")
 
-    if any(kw in text for kw in CIBERSEGURIDAD_KEYWORDS):
-        score += 3
-        if any(kw in text for kw in CIBERSEGURIDAD_EVENTO_KEYWORDS):
-            score += 2
-        categorias.append("ciberseguridad")
 
     if any(kw in text for kw in RA_KEYWORDS):
         score += 3
@@ -1385,12 +1347,10 @@ rankeada.
 REGLA DE ORO: NINGUNA CATEGORÍA VALE MÁS QUE OTRA POR DEFAULT
 ===========================================
 tecno.ar cubre Smartphones, Hardware, Gaming, Empresas, Ciencia, Vehículos,
-Hogar, Cripto, RA/RV, IA y Ciberseguridad. Estas categorías son TODAS de
+Hogar, Cripto, RA/RV, IA. Estas categorías son TODAS de
 igual jerarquía de partida. NO existe una tabla de prioridad fija donde
-"lanzamiento de hardware" le gane automáticamente a "ciberseguridad" o
-viceversa. Una vulnerabilidad crítica real, un ransomware que afectó a
-miles de usuarios, o una filtración de datos masiva DEBEN poder superar en
-el ranking a un lanzamiento de producto menor, si su impacto real es mayor.
+"lanzamiento de hardware" le gane automáticamente a otra o
+viceversa.
 Evaluá cada noticia por su propio mérito periodístico, no por a qué
 categoría pertenece.
 
@@ -1434,17 +1394,13 @@ CÓMO SE VE UN EJE 1 ALTO EN CADA CATEGORÍA (ejemplos, no jerarquía)
 ===========================================
 - Hardware/Smartphones: "Samsung presenta el Galaxy S26 con nuevo procesador propio"
 - IA: "OpenAI lanza GPT-6 con capacidades de razonamiento mejoradas"
-- Empresas: "Microsoft adquiere la startup de ciberseguridad XDR por USD 500 millones"
+- Empresas: "Microsoft adquiere la startup XDR por USD 500 millones"
 - Gaming: "Nintendo confirma la fecha de lanzamiento del nuevo Zelda"
 - Vehículos: "Tesla presenta una actualización de Autopilot con nuevo hardware"
 - RA/RV: "Meta lanza una actualización de software para Quest 3"
 - Cripto: "PayPal habilita pagos en Bitcoin para comercios en Argentina"
 - Ciencia: "SpaceX confirma la fecha del próximo lanzamiento de Starship"
 - Hogar: "Amazon presenta un nuevo Echo con IA integrada"
-- Ciberseguridad: "Ransomware ataca los servidores de una aerolínea europea" /
-  "Descubren vulnerabilidad crítica en routers Cisco, ya hay parche
-  disponible" / "Filtración expone datos de 2 millones de usuarios de una
-  app de delivery"
 
 Ejemplos de EJE 1 bajo o descarte en cualquier categoría: "Se filtran
 posibles specs del próximo iPhone" (rumor), "5 cosas que esperamos ver en
