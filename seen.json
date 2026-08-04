@@ -1362,5 +1362,25 @@
   "311171190f2e30aafb80d3e4b57a1277f49cc1c578f970836dc50a84ff358d28": {
     "title": "Apple Acquiring Materials Science Company PlasmaSolve",
     "date": "2026-08-03T22:02:36.360424"
+  },
+  "73a08588feeda26d5643cde127b5fa4e1b8ab5da8b15f674d3db5991f4200927": {
+    "title": "OpenAI Posts Public Rebuttal to Apple's Trade Secrets Lawsuit",
+    "date": "2026-08-04T17:02:33.430760"
+  },
+  "6de4c8ec039d4f71bddd9263116e6849eae4107ae5bcf5f82e8052aadf982ab9": {
+    "title": "Google ADK flaws reveal what happens when AI agents trust the wrong message",
+    "date": "2026-08-04T17:02:33.430777"
+  },
+  "755ff25cf9ac02efa5dfeeb1851297627f59832b8a2c5d75fbff8eb44aaecec9": {
+    "title": "Nvidia open sources cuFile API, accelerating GPU read/write capability for high-speed storage",
+    "date": "2026-08-04T17:02:33.430779"
+  },
+  "b0d52de738b6a4749f3d512cc6a1636b93fb1f50547ca5067759d7ea6e1227de": {
+    "title": "New HBF spec outlines tech that can give GPUs terabytes of extra memory — Sandisk and SK hynix unveil spec with up to 16-Hi NAND stacks, 3 TB/s bandwidth, UCIe",
+    "date": "2026-08-04T17:02:33.430781"
+  },
+  "5e1cac9da38948c45b6f443f894f8f372ff3c4882cf68bcabbd9644f1200c1de": {
+    "title": "T-Mobile’s $0-down financing plan bundles taxes and fees",
+    "date": "2026-08-04T17:02:33.430782"
   }
 }
