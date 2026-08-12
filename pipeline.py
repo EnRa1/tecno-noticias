@@ -1,38 +1,53 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 4.9 - 5 items/corrida + cap con relleno
+Pipeline de automatizacion para tecno.ar (Hybrid 5.0 - 5 items/corrida + cap con relleno
 + historial de categorias para diversidad tematica + dedup tematico manejado por IA
-+ manejo robusto de errores por item + cierre opcional de impacto en Argentina
-+ señal de desempate por conexion local en el ranking)
++ dedup DETERMINISTICO por similitud de texto (contra historial y entre candidatos)
++ CAP DURO por categoria ademas del cap por fuente + manejo robusto de errores por item
++ cierre opcional de impacto en Argentina + señal de desempate por conexion local
++ GENERACION PERIODICA DE ARTICULOS TRANSACCIONALES (guias de compra) con datos
+verificados por busqueda en tiempo real, nunca inventados
 ==================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
-2. Filtro contextual con Gemini (1 sola llamada, con retry, modelo 2.5-flash) -> devuelve
+2. DEDUP DETERMINISTICO por similitud de texto: se descartan candidatos que ya
+   son el mismo hecho que algo publicado recientemente, y se agrupan entre si
+   los candidatos de la misma corrida que cubren el mismo hecho (quedandonos
+   con el mejor representante), ANTES de gastar tokens de Gemini en rankear.
+3. Filtro contextual con Gemini (1 sola llamada, con retry, modelo 2.5-flash) -> devuelve
    un pool priorizado mas grande que MAX_ITEMS_PER_RUN, para poder aplicar el cap por
    fuente sin perder noticias importantes si se concentran en un mismo medio.
    Ademas recibe el HISTORIAL DE CATEGORIAS de las ultimas notas publicadas, para usarlo
    como criterio de DESEMPATE (no como cuota dura) y evitar que el feed se concentre
    siempre en las mismas 1-2 categorias. Tambien recibe el HISTORIAL DE TEMAS ya
-   publicados y la propia lista a evaluar, para descartar duplicados tematicos
-   (mismo hecho cubierto por medios distintos) directamente en el criterio del modelo,
-   sin depender de similitud de texto en Python. Como señal ADICIONAL de desempate
-   (nunca como filtro duro ni como eje que reemplace el merito periodistico) se pondera
-   levemente una conexion local (Argentina/LatAm) real y concreta.
-3. Triangulacion de fuentes: el grounding de Gemini con Google Search, restringido a
+   publicados y la propia lista a evaluar, como SEGUNDA capa de dedup semantico
+   (la primera, determinista, ya corrio en el paso 2). Como señal ADICIONAL de
+   desempate (nunca como filtro duro ni como eje que reemplace el merito
+   periodistico) se pondera levemente una conexion local (Argentina/LatAm) real.
+4. Seleccion final con CAP DURO por fuente Y por categoria (no solo desempate):
+   ninguna categoria puede ocupar mas de MAX_POR_CATEGORIA lugares de la corrida,
+   sin importar cuantos candidatos de esa categoria hayan rankeado bien.
+5. Triangulacion de fuentes: el grounding de Gemini con Google Search, restringido a
    UNA SOLA fuente de MAXIMA AUTORIDAD (ver FUENTES_MAXIMA_AUTORIDAD), es el metodo
    PRIORITARIO por su precision semantica; si no encuentra nada dentro de esa
    whitelist chica (para no gastar tokens de mas), cae como RESPALDO a la busqueda
    directa deterministica con Google Custom Search (web abierta sin restriccion de
    sitio primero, despues sitios de referencia, despues pool de RSS local), que no
    consume tokens de Gemini.
-4. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
-5. Busqueda de imagen relevante via Google Custom Search API
-6. Redaccion con Gemini + VALIDACION PROGRAMATICA (no depende de autoevaluacion
+6. Extraccion del articulo completo desde todas las fuentes (trafilatura + readability)
+7. Busqueda de imagen relevante via Google Custom Search API
+8. Redaccion con Gemini + VALIDACION PROGRAMATICA (no depende de autoevaluacion
    del modelo): detecta repeticion de palabras en titulo/H1 en Python puro y
    pide correccion especifica con reintentos si encuentra problemas. En la misma
    llamada de redaccion (sin pasadas adicionales que gasten mas tokens de Gemini),
    se le pide al modelo un cierre OPCIONAL de impacto en Argentina: solo se agrega
    al articulo si el propio modelo encuentra una conexion real y concreta; si no,
    se omite por completo en vez de forzarla.
+9. Cada GENERAR_TRANSACCIONAL_CADA_N_CORRIDAS corridas, ademas de las noticias,
+   se genera UN articulo transaccional (guia de compra de hardware/smarthome/etc.)
+   con datos de productos y precios obtenidos OBLIGATORIAMENTE via busqueda web en
+   tiempo real (grounding de Gemini). Si no se puede verificar informacion actual
+   de al menos MIN_PRODUCTOS_TRANSACCIONAL productos vigentes, se descarta esa
+   guia por completo en vez de publicar con datos viejos o inventados.
 
 Cada item se procesa dentro de un try/except individual en main(), de forma que
 un fallo en cualquier etapa (triangulacion, extraccion, imagen, redaccion) para
@@ -55,6 +70,7 @@ import os
 import re
 import time
 import hashlib
+import random
 from collections import Counter
 from pathlib import Path
 from datetime import datetime, timezone
@@ -74,10 +90,13 @@ DRAFTS_DIR = BASE_DIR / "drafts"
 TITULOS_RECIENTES_FILE = BASE_DIR / "titulos_recientes.json"
 CATEGORIAS_RECIENTES_FILE = BASE_DIR / "categorias_recientes.json"
 TEMAS_RECIENTES_FILE = BASE_DIR / "temas_recientes.json"
+TRANSACCIONAL_TEMAS_FILE = BASE_DIR / "temas_transaccionales_recientes.json"
+CONTADOR_CORRIDAS_FILE = BASE_DIR / "contador_corridas.json"
 
 MAX_TITULOS_RECIENTES = 15
 MAX_CATEGORIAS_RECIENTES = 20  # ventana de "memoria" para el desempate por diversidad
 MAX_TEMAS_RECIENTES = 15       # ventana de "memoria" para dedup tematico (mismo hecho)
+MAX_TEMAS_TRANSACCIONALES = 12
 MAX_REINTENTOS_TITULO = 2
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -103,6 +122,31 @@ MAX_HOURS_OLD = 12
 DELAY_ENTRE_FASES = 15
 GEMINI_MAX_RETRIES = 4
 GEMINI_BASE_BACKOFF = 8
+
+# ----------------------------------------------------------------------
+# ARTICULOS TRANSACCIONALES (guias de compra con datos verificados por busqueda)
+# ----------------------------------------------------------------------
+# Se generan cada N corridas del pipeline (no en cada corrida, para no competir
+# por rate limit con las noticias). El requisito NO NEGOCIABLE es que todos los
+# precios/specs salgan de una busqueda real y reciente (grounding de Gemini con
+# Google Search); si no se puede verificar suficiente informacion actual, la
+# guia se descarta por completo en vez de publicarse con datos viejos o inventados.
+GENERAR_TRANSACCIONAL_CADA_N_CORRIDAS = 3
+MIN_PRODUCTOS_TRANSACCIONAL = 3
+
+TEMAS_TRANSACCIONALES = [
+    {"categoria": "hardware", "tema": "mejores placas de video para gaming"},
+    {"categoria": "hardware", "tema": "mejores procesadores para PC gamer"},
+    {"categoria": "hardware", "tema": "mejores monitores para gaming y trabajo"},
+    {"categoria": "hardware", "tema": "mejores SSD para PC"},
+    {"categoria": "hogar", "tema": "mejores asistentes de voz y parlantes inteligentes"},
+    {"categoria": "hogar", "tema": "mejores camaras de seguridad para el hogar"},
+    {"categoria": "hogar", "tema": "mejores robots aspiradora"},
+    {"categoria": "hogar", "tema": "mejores enchufes y tomas inteligentes"},
+    {"categoria": "hardware", "tema": "mejores smartwatches"},
+    {"categoria": "hardware", "tema": "mejores auriculares inalambricos"},
+    {"categoria": "hardware", "tema": "mejores power banks"},
+]
 
 # ----------------------------------------------------------------------
 # ESPERAS PROACTIVAS ANTI RATE-LIMIT
@@ -150,6 +194,13 @@ FUENTES_MAXIMA_AUTORIDAD = [
 
 SIMILITUD_MINIMA = 0.18
 UMBRAL_RELEVANCIA_CASCADA = 0.12
+
+# Umbrales para el dedup DETERMINISTICO (no depende de Gemini). Son mas
+# permisivos que SIMILITUD_MINIMA (que se usa para triangulacion, un caso
+# distinto) porque acá el objetivo es agrupar cobertura del MISMO HECHO
+# entre distintos medios, que suelen compartir bastante vocabulario.
+SIMILITUD_DEDUP_INTERNO = 0.25     # dos candidatos de la MISMA corrida = mismo hecho
+SIMILITUD_DEDUP_HISTORIAL = 0.22   # candidato vs. algo ya publicado = mismo hecho
 
 SITIOS_REFERENCIA_BUSQUEDA = [
     "techcrunch.com",
@@ -358,8 +409,9 @@ def load_temas_recientes():
     ultimas notas publicadas, para que Gemini pueda detectar si una
     noticia candidata cubre el MISMO HECHO que algo ya publicado
     recientemente (aunque venga de un medio distinto o tenga un titulo
-    distinto). Es un chequeo semantico hecho por el modelo, no una
-    comparacion de similitud de texto en Python.
+    distinto). Es un chequeo semantico hecho por el modelo, y ADEMAS
+    (ver deduplicar_contra_historial) un chequeo determinista por
+    similitud de texto en Python, como primera linea de defensa.
     """
     if TEMAS_RECIENTES_FILE.exists():
         try:
@@ -378,6 +430,33 @@ def guardar_tema_reciente(item):
     TEMAS_RECIENTES_FILE.write_text(
         json.dumps(temas, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+def load_temas_transaccionales_recientes():
+    if TRANSACCIONAL_TEMAS_FILE.exists():
+        try:
+            return json.loads(TRANSACCIONAL_TEMAS_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return []
+    return []
+
+def guardar_tema_transaccional_reciente(tema):
+    temas = load_temas_transaccionales_recientes()
+    temas.append(tema)
+    temas = temas[-MAX_TEMAS_TRANSACCIONALES:]
+    TRANSACCIONAL_TEMAS_FILE.write_text(
+        json.dumps(temas, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+def load_contador_corridas():
+    if CONTADOR_CORRIDAS_FILE.exists():
+        try:
+            return json.loads(CONTADOR_CORRIDAS_FILE.read_text(encoding="utf-8")).get("contador", 0)
+        except json.JSONDecodeError:
+            return 0
+    return 0
+
+def guardar_contador_corridas(valor):
+    CONTADOR_CORRIDAS_FILE.write_text(json.dumps({"contador": valor}), encoding="utf-8")
 
 def extraer_campo(article_md, nombre_campo):
     """Extrae el contenido de un campo '## NOMBRE_CAMPO' del markdown generado."""
@@ -484,6 +563,78 @@ def _google_search_con_reintentos(params, contexto=""):
             print(f"    ⚠️ Excepción de red agotó reintentos en {contexto}: {e}")
             return None
     return None
+
+# ----------------------------------------------------------------------
+# DEDUP DETERMINISTICO (similitud de texto en Python, sin depender de IA)
+# ----------------------------------------------------------------------
+# Estos dos filtros corren ANTES de gastar una llamada a Gemini en el
+# ranking. La idea es que el dedup semantico dentro del prompt de
+# rank_with_gemini quede como SEGUNDA capa (para casos donde la similitud
+# de texto no alcanza, ej. redacciones muy distintas del mismo hecho), y
+# no como la UNICA linea de defensa contra la repeticion de noticias.
+
+def deduplicar_contra_historial(candidatos, temas_recientes):
+    """Descarta candidatos que ya son, por similitud de texto, el mismo
+    hecho que algo publicado recientemente en tecno.ar."""
+    if not temas_recientes:
+        return candidatos
+
+    sobrevivientes = []
+    for c in candidatos:
+        texto_c = c["title"] + " " + c["summary"]
+        duplicado = False
+        for t in temas_recientes:
+            texto_t = t["title"] + " " + t["summary"]
+            sim = similitud_texto(texto_c, texto_t)
+            if sim >= SIMILITUD_DEDUP_HISTORIAL:
+                print(f"    🧹 Descartado por similitud con tema ya publicado "
+                      f"({sim:.0%}): {c['title'][:60]}")
+                duplicado = True
+                break
+        if not duplicado:
+            sobrevivientes.append(c)
+
+    return sobrevivientes
+
+def deduplicar_internos(candidatos):
+    """
+    Agrupa candidatos de la MISMA corrida que hablan del mismo hecho
+    (distintos medios cubriendo el mismo evento) y se queda con un solo
+    representante por grupo: el de mayor score_reglas, y en empate el que
+    venga de una fuente de maxima autoridad.
+    """
+    def es_autoridad(fuente):
+        return any(dom in fuente.lower() for dom in FUENTES_MAXIMA_AUTORIDAD)
+
+    representantes = []
+    usados = [False] * len(candidatos)
+
+    for i, item in enumerate(candidatos):
+        if usados[i]:
+            continue
+        grupo = [item]
+        usados[i] = True
+        texto_i = item["title"] + " " + item["summary"]
+
+        for j in range(i + 1, len(candidatos)):
+            if usados[j]:
+                continue
+            texto_j = candidatos[j]["title"] + " " + candidatos[j]["summary"]
+            if similitud_texto(texto_i, texto_j) >= SIMILITUD_DEDUP_INTERNO:
+                grupo.append(candidatos[j])
+                usados[j] = True
+
+        if len(grupo) > 1:
+            print(f"    🧹 {len(grupo)} candidatos son el mismo hecho, se conserva 1: "
+                  + " | ".join(g["title"][:40] for g in grupo))
+            grupo.sort(
+                key=lambda x: (x["score_reglas"], es_autoridad(x["source"])),
+                reverse=True,
+            )
+
+        representantes.append(grupo[0])
+
+    return representantes
 
 # ----------------------------------------------------------------------
 # VALIDACION PROGRAMATICA DE TITULOS (determinista, no depende de la IA)
@@ -1270,15 +1421,14 @@ def rank_with_gemini(candidatos, categorias_recientes=None, temas_recientes=None
     publicadas. Se usa SOLO como criterio de desempate para favorecer
     diversidad tematica cuando dos o mas candidatos quedan parejos en
     merito periodistico — nunca como cuota dura ni para descartar una
-    noticia fuerte por su categoria.
+    noticia fuerte por su categoria. (El limite DURO por categoria se
+    aplica despues, en _seleccionar_final_con_relleno.)
 
     temas_recientes: lista de dicts {'title', 'summary'} de las ultimas
-    notas YA PUBLICADAS. Se usa para que el propio Gemini descarte
-    candidatos que cubran el MISMO HECHO que algo ya publicado, y tambien
-    para deduplicar entre si los candidatos de la lista actual (ej. tres
-    medios distintos cubriendo la misma noticia en la misma corrida).
-    Esto es un chequeo semantico hecho por el modelo, no una comparacion
-    de similitud de texto en Python.
+    notas YA PUBLICADAS. A esta altura del pipeline ya corrio el dedup
+    determinista por similitud de texto (deduplicar_contra_historial /
+    deduplicar_internos), asi que este bloque queda como SEGUNDA capa
+    semantica para casos que la similitud de texto no haya detectado.
     """
     if not candidatos:
         return candidatos
@@ -1339,9 +1489,9 @@ la lista al final de este mensaje.
 IMPORTANTE: no selecciones solo un puñado fijo. Devolveme un RANKING de
 hasta {pool_objetivo} noticias ordenadas de mas a menos relevante, porque
 despues un proceso automatico va a aplicar un limite de diversidad por
-medio sobre tu ranking, y necesita "suplentes" priorizados por si alguna
-noticia del tope queda descartada por venir del mismo medio que otra mejor
-rankeada.
+medio Y por categoría sobre tu ranking, y necesita "suplentes" priorizados
+por si alguna noticia del tope queda descartada por venir del mismo medio o
+categoría que otra mejor rankeada.
 
 ===========================================
 REGLA DE ORO: NINGUNA CATEGORÍA VALE MÁS QUE OTRA POR DEFAULT
@@ -1441,7 +1591,11 @@ contexto SOLO para desempatar cuando dos o más noticias queden realmente
 parejas en mérito periodístico: en ese caso, dale prioridad en el ranking a
 la que pertenezca a una categoría menos representada en el historial
 reciente, para que el feed no se concentre siempre en las mismas 1-2
-categorías.
+categorías. (Ademas de este desempate blando, un proceso automatico va a
+aplicar despues un TOPE DURO de noticias por categoría sobre tu ranking, asi
+que aunque priorices varias notas de la misma categoría, no todas van a
+terminar publicandose si superan ese tope — por eso es importante que tu
+ORDEN de prioridad dentro de cada categoría sea el correcto.)
 {bloque_temas_previos}
 ===========================================
 DEDUPLICACION DENTRO DE ESTA MISMA LISTA
@@ -1509,41 +1663,81 @@ JSON. Formato exacto: {{"seleccionados": [3, 7, 12, 1, 9]}}
 # ----------------------------------------------------------------------
 
 MAX_POR_FUENTE = max(1, MAX_ITEMS_PER_RUN // 2)
+# Tope DURO (no desempate) de cuantas notas de una misma categoria pueden
+# entrar en una corrida. Con MAX_ITEMS_PER_RUN=5 esto permite como maximo 2
+# de una misma categoria (ej. IA), sin importar cuantos candidatos de esa
+# categoria hayan quedado bien rankeados por Gemini.
+MAX_POR_CATEGORIA = max(1, MAX_ITEMS_PER_RUN // 2)
 
 def _seleccionar_final_con_relleno(ranking_priorizado):
     """
-    Recorre el ranking priorizado (ya ordenado de mas a menos relevante)
-    en DOS pasadas:
+    Recorre el ranking priorizado (ya ordenado de mas a menos relevante) en
+    varias pasadas, aplicando dos topes DUROS a la vez (no solo desempate):
 
-    1ra pasada: respeta MAX_POR_FUENTE (cap de diversidad por medio).
+    1ra pasada: respeta MAX_POR_FUENTE (diversidad de medios) Y
+    MAX_POR_CATEGORIA (diversidad tematica) al mismo tiempo.
+
     2da pasada (solo si hacen falta mas items para llegar a
-    MAX_ITEMS_PER_RUN): recorre los candidatos que quedaron afuera por el
-    cap, en el mismo orden de prioridad, IGNORANDO el cap, para no
-    desperdiciar un lugar cuando no hay suplentes de otras fuentes
-    disponibles. Prioriza llenar los MAX_ITEMS_PER_RUN lugares por sobre
-    mantener la diversidad artificial.
+    MAX_ITEMS_PER_RUN): se relaja el tope de CATEGORIA pero se mantiene el
+    de FUENTE, para no perder un lugar si la sobrerrepresentacion es
+    tematica y no de medios.
+
+    3ra pasada (ultimo recurso): se relajan ambos topes, para nunca publicar
+    menos de MAX_ITEMS_PER_RUN si hay candidatos disponibles.
     """
     seleccionados_final = []
-    descartados_por_cap = []
-    conteo_por_fuente = {}
+    descartados = []
+    conteo_fuente = {}
+    conteo_categoria = {}
 
+    def cabe(item):
+        fuente = item["source"]
+        categoria = item.get("categoria_reglas", "general")
+        return (
+            conteo_fuente.get(fuente, 0) < MAX_POR_FUENTE
+            and conteo_categoria.get(categoria, 0) < MAX_POR_CATEGORIA
+        )
+
+    def registrar(item):
+        fuente = item["source"]
+        categoria = item.get("categoria_reglas", "general")
+        conteo_fuente[fuente] = conteo_fuente.get(fuente, 0) + 1
+        conteo_categoria[categoria] = conteo_categoria.get(categoria, 0) + 1
+
+    # Pasada 1: respeta ambos topes (fuente y categoría) a la vez.
     for item in ranking_priorizado:
         if len(seleccionados_final) >= MAX_ITEMS_PER_RUN:
             break
-        fuente = item["source"]
-        if conteo_por_fuente.get(fuente, 0) >= MAX_POR_FUENTE:
-            descartados_por_cap.append(item)
-            continue
+        if cabe(item):
+            seleccionados_final.append(item)
+            registrar(item)
+        else:
+            descartados.append(item)
 
-        seleccionados_final.append(item)
-        conteo_por_fuente[fuente] = conteo_por_fuente.get(fuente, 0) + 1
-
-    if len(seleccionados_final) < MAX_ITEMS_PER_RUN and descartados_por_cap:
+    # Pasada 2: si faltan lugares, se relaja SOLO el tope de categoría.
+    if len(seleccionados_final) < MAX_ITEMS_PER_RUN and descartados:
         faltan = MAX_ITEMS_PER_RUN - len(seleccionados_final)
-        print(f"    ℹ️ Faltan {faltan} noticia(s) para llegar a {MAX_ITEMS_PER_RUN}; "
-              f"se completa con candidatos que habían quedado afuera por el cap "
-              f"de diversidad por fuente, respetando el orden de prioridad.")
-        for item in descartados_por_cap:
+        print(f"    ℹ️ Faltan {faltan} noticia(s); se relaja el tope de "
+              f"categoría (se mantiene el de fuente) para completar.")
+        aun_descartados = []
+        for item in descartados:
+            if len(seleccionados_final) >= MAX_ITEMS_PER_RUN:
+                aun_descartados.append(item)
+                continue
+            fuente = item["source"]
+            if conteo_fuente.get(fuente, 0) >= MAX_POR_FUENTE:
+                aun_descartados.append(item)
+                continue
+            seleccionados_final.append(item)
+            conteo_fuente[fuente] = conteo_fuente.get(fuente, 0) + 1
+        descartados = aun_descartados
+
+    # Pasada 3: ultimo recurso, se relajan ambos topes para no publicar de
+    # menos si hay candidatos priorizados disponibles.
+    if len(seleccionados_final) < MAX_ITEMS_PER_RUN and descartados:
+        print(f"    ℹ️ Aún faltan noticias; se relajan ambos topes (fuente y "
+              f"categoría) como último recurso.")
+        for item in descartados:
             if len(seleccionados_final) >= MAX_ITEMS_PER_RUN:
                 break
             seleccionados_final.append(item)
@@ -1598,15 +1792,29 @@ def fetch_new_relevant_items():
           f"(pool de triangulación: {len(candidatos_para_triangular)})")
 
     if not candidatos:
-        return [], []
+        return [], candidatos_para_triangular
+
+    categorias_recientes = load_categorias_recientes()
+    temas_recientes = load_temas_recientes()
+
+    # --- DEDUP DETERMINISTICO (antes de gastar tokens de Gemini) ---
+    antes = len(candidatos)
+    candidatos = deduplicar_contra_historial(candidatos, temas_recientes)
+    candidatos = deduplicar_internos(candidatos)
+    if len(candidatos) < antes:
+        print(f"🧹 Dedup determinista: {antes} → {len(candidatos)} candidatos "
+              f"(se descartaron {antes - len(candidatos)} por ser el mismo hecho "
+              f"que algo ya publicado o que otro candidato de esta corrida).")
+
+    if not candidatos:
+        print("ℹ️ Todos los candidatos eran duplicados de temas ya publicados o "
+              "entre sí. No hay nada nuevo para procesar en esta corrida.")
+        return [], candidatos_para_triangular
 
     if len(candidatos) > 30:
         candidatos.sort(key=lambda x: x["score_reglas"], reverse=True)
         candidatos = candidatos[:30]
         print("🔪 Limitando a 30 para el ranking contextual.")
-
-    categorias_recientes = load_categorias_recientes()
-    temas_recientes = load_temas_recientes()
 
     ranking_priorizado = rank_with_gemini(
         candidatos,
@@ -1915,6 +2123,224 @@ Al final del ARTICULO, agrega: "Fuente: {fuentes_finales_str}"
 """
 
 # ----------------------------------------------------------------------
+# ARTICULOS TRANSACCIONALES (guias de compra, datos verificados por busqueda)
+# ----------------------------------------------------------------------
+
+def elegir_tema_transaccional():
+    """
+    Elige un tema de TEMAS_TRANSACCIONALES priorizando los que no aparecen
+    en el historial reciente de temas transaccionales, para no repetir
+    siempre la misma guia (ej. "placas de video" todas las veces).
+    """
+    recientes = load_temas_transaccionales_recientes()
+    disponibles = [t for t in TEMAS_TRANSACCIONALES if t["tema"] not in recientes]
+    if not disponibles:
+        disponibles = TEMAS_TRANSACCIONALES
+    return random.choice(disponibles)
+
+def buscar_datos_actualizados_transaccional(tema_info):
+    """
+    Requisito NO NEGOCIABLE: toda la informacion de productos (precio,
+    specs) tiene que salir de una busqueda real y reciente via grounding
+    de Gemini con Google Search, nunca del conocimiento previo del modelo.
+    Si no se puede verificar suficiente informacion actual y vigente, esta
+    funcion devuelve None y el articulo transaccional se descarta por
+    completo en vez de publicarse con datos viejos o inventados.
+    """
+    if not GEMINI_API_KEY:
+        print("    ⚠️ Sin GEMINI_API_KEY, no se puede verificar información actual.")
+        return None
+
+    prompt = f"""
+Busca en la web informacion ACTUAL (de los ultimos 1-3 meses, no uses datos
+viejos de tu conocimiento previo) sobre: "{tema_info['tema']}", pensando en
+el mercado de Argentina cuando sea posible (precios en pesos argentinos o
+dolares si el producto no se vende oficialmente en el pais).
+
+Para CADA producto que incluyas, necesito datos VERIFICADOS por la busqueda,
+nunca inventados ni estimados:
+- Nombre y modelo exacto del producto
+- Precio actual aproximado (y en que mercado/tienda lo viste)
+- 2-3 especificaciones o caracteristicas clave y verificables
+- Un punto fuerte y una limitacion real
+- La URL de la fuente donde encontraste el dato
+
+Encontra entre 4 y 6 productos relevantes y VIGENTES (que se puedan comprar
+hoy, no descontinuados). Si para alguno no podes verificar precio o specs
+con la busqueda, DESCARTALO en vez de completar con un estimado.
+
+Devolveme SOLO un JSON:
+{{"productos": [{{"nombre": "...", "precio": "...", "mercado_precio": "...",
+"specs": ["...", "..."], "punto_fuerte": "...", "limitacion": "...",
+"fuente_url": "...", "fuente_nombre": "..."}}]}}
+
+Si no podes verificar datos actuales y confiables de al menos {MIN_PRODUCTOS_TRANSACCIONAL}
+productos vigentes, devolveme {{"productos": []}}.
+"""
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.2},
+    }
+
+    try:
+        print(f"    🔎 Buscando datos actuales para: '{tema_info['tema']}'...")
+        data = call_gemini_grounding_api(payload, context="transaccional-busqueda")
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
+        productos = json.loads(raw_text).get("productos", [])
+
+        productos_validos = []
+        for p in productos:
+            link = p.get("fuente_url", "")
+            link_resuelto = _resolver_url_real(link) if link else None
+            if not link_resuelto:
+                continue
+            p["fuente_url"] = link_resuelto
+            productos_validos.append(p)
+
+        if len(productos_validos) < MIN_PRODUCTOS_TRANSACCIONAL:
+            print(f"    ⚠️ Solo {len(productos_validos)} producto(s) verificados "
+                  f"(mínimo {MIN_PRODUCTOS_TRANSACCIONAL}); se descarta esta guía "
+                  f"para no publicar con datos incompletos o desactualizados.")
+            return None
+
+        print(f"    ✅ {len(productos_validos)} productos verificados vía búsqueda.")
+        return productos_validos
+
+    except Exception as e:
+        print(f"    ⚠️ No se pudo verificar info actual ({e}), se descarta esta guía.")
+        return None
+
+def build_prompt_transaccional(tema_info, productos, titulos_recientes=None):
+    titulos_recientes = titulos_recientes or []
+
+    bloque_productos = ""
+    for i, p in enumerate(productos, 1):
+        specs = ", ".join(p.get("specs", []))
+        bloque_productos += f"""
+PRODUCTO {i}: {p.get('nombre')}
+Precio verificado: {p.get('precio')} ({p.get('mercado_precio')})
+Specs verificadas: {specs}
+Punto fuerte: {p.get('punto_fuerte')}
+Limitación: {p.get('limitacion')}
+Fuente: {p.get('fuente_nombre')} — {p.get('fuente_url')}
+"""
+
+    bloque_titulos = ""
+    if titulos_recientes:
+        lista_titulos = "\n".join(f"- {t}" for t in titulos_recientes)
+        bloque_titulos = f"""
+TITULOS YA PUBLICADOS RECIENTEMENTE (no repetir estructura ni formula):
+{lista_titulos}
+"""
+
+    return f"""Actua como redactor SEO senior de tecno.ar, escribiendo una
+GUIA DE COMPRA sobre: "{tema_info['tema']}".
+
+REGLA NO NEGOCIABLE: todos los precios, modelos y specs salen EXCLUSIVAMENTE
+de los datos verificados abajo (obtenidos por busqueda real y actual). NO
+agregues productos, precios ni specs fuera de esta lista, ni completes con
+conocimiento propio.
+
+===========================================
+DATOS VERIFICADOS POR BUSQUEDA (única fuente de verdad)
+===========================================
+{bloque_productos}
+{bloque_titulos}
+===========================================
+CAMPOS A GENERAR (en este orden exacto)
+===========================================
+
+## FOCUS_KEYWORD
+[frase natural, ej. "mejores placas de video para gaming en 2026". Debe
+poder leerse dentro de una oracion normal en español.]
+
+## SEO_TITLE
+Entre 50 y 60 caracteres. El focus keyword tiene que aparecer cerca del
+inicio. Verificá que ninguna palabra significativa del keyword se repita
+fuera de su unica insercion.
+
+## SLUG
+version-corta-en-minusculas-con-guiones-del-focus-keyword
+
+## META_DESCRIPTION
+Entre 150 y 160 caracteres, incluye el focus keyword (string identico). Sin
+markdown.
+
+## H1
+Mismo criterio que SEO_TITLE. Puede ser identico o una variacion minima.
+
+## ARTICULO
+Guia de compra en Markdown (700-1000 palabras):
+- Intro breve (2-3 lineas) presentando el criterio de la seleccion.
+- Un H2 por producto, usando EXCLUSIVAMENTE los datos verificados de arriba
+  (precio, specs, punto fuerte, limitación) — no inventes nada que no este
+  en la lista de productos.
+- Un enlace a la fuente_url dentro de cada seccion de producto, con texto
+  de ancla natural (no "click aqui" ni la URL pelada).
+- Un H2 de cierre con una recomendación según presupuesto/uso.
+- Al pie del cuerpo, una linea breve aclarando que los precios pueden
+  variar y la fecha de esta guía.
+- El focus keyword debe aparecer en el primer párrafo y en al menos un H2,
+  sin repetirlo de forma forzada.
+
+## IMPACTO_ARGENTINA
+N/A
+
+===========================================
+FORMATO DE SALIDA
+===========================================
+Devolveme EXCLUSIVAMENTE los campos de arriba, con esos encabezados exactos
+en Markdown. No agregues explicaciones fuera de esa estructura.
+"""
+
+def generar_articulo_transaccional():
+    """
+    Genera UN articulo transaccional (guia de compra), solo si se pudo
+    verificar informacion actual y vigente via busqueda. Reutiliza toda la
+    infraestructura de validacion/reintentos y de historial ya existente
+    para las noticias, para que el resultado sea consistente en calidad y
+    para que tambien compita por diversidad de categoria en las proximas
+    corridas de noticias (guardar_categoria_reciente).
+    """
+    print("\n" + "="*60)
+    print("🛒 Generando artículo transaccional...")
+
+    tema_info = elegir_tema_transaccional()
+    productos = buscar_datos_actualizados_transaccional(tema_info)
+    if not productos:
+        print("    ℹ️ No se generó artículo transaccional en esta corrida "
+              "(no se pudo verificar información actual suficiente).")
+        return
+
+    titulos_recientes = load_titulos_recientes()
+    prompt = build_prompt_transaccional(tema_info, productos, titulos_recientes)
+
+    # item ficticio: save_draft/aplicar_cierre_argentina solo necesitan
+    # 'title' y 'link' (aunque este ultimo quede vacio, no hay URL de
+    # "fuente original" unica en una guia con multiples productos).
+    item_ficticio = {"title": f"Guía: {tema_info['tema']}", "link": ""}
+
+    try:
+        article = redactar_con_validacion(prompt, item_ficticio)
+        article = aplicar_cierre_argentina(article)
+
+        save_draft(item_ficticio, article, imagen_url=None)
+
+        seo_title = extraer_seo_title(article)
+        if seo_title:
+            guardar_titulo_reciente(seo_title)
+
+        guardar_categoria_reciente(tema_info["categoria"])
+        guardar_tema_transaccional_reciente(tema_info["tema"])
+
+        print(f"    ✅ Artículo transaccional generado: {tema_info['tema']}")
+
+    except Exception as e:
+        print(f"    ⚠️ Error generando artículo transaccional: {type(e).__name__}: {e}")
+
+# ----------------------------------------------------------------------
 # REDACCION CON GEMINI + VALIDACION PROGRAMATICA CON REINTENTOS
 # ----------------------------------------------------------------------
 
@@ -2040,7 +2466,7 @@ def save_draft(item, article_md, imagen_url=None):
     header = (
         f"<!--\n"
         f"ESTADO: borrador sin revisar - NO publicar directo\n"
-        f"Fuente original: {item['link']}\n"
+        f"Fuente original: {item.get('link', '')}\n"
         f"Imagen sugerida: {imagen_url or ''}\n"
         f"Fecha generacion: {datetime.now().isoformat()}\n"
         f"-->\n\n"
@@ -2053,20 +2479,27 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 4.9 (5 items/corrida + cap con relleno "
-          "+ diversidad de categorias + dedup tematico por IA + manejo robusto "
-          "de errores por item + grounding con 1 fuente de maxima autoridad como "
-          "metodo prioritario / Custom Search como respaldo + esperas anti "
-          "rate-limit + cierre opcional de impacto en Argentina)...")
+    print("🚀 Iniciando pipeline Hybrid 5.0 (5 items/corrida + cap con relleno "
+          "+ diversidad de categorias con TOPE DURO + dedup DETERMINISTICO por "
+          "similitud de texto + dedup tematico por IA como 2da capa + manejo "
+          "robusto de errores por item + grounding con 1 fuente de maxima "
+          "autoridad como metodo prioritario / Custom Search como respaldo + "
+          "esperas anti rate-limit + cierre opcional de impacto en Argentina + "
+          "articulos transaccionales periodicos con datos verificados por "
+          "busqueda)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
     print(f"DEBUG: GEMINI_GROUNDING_MODEL (grounding prioritario + ranking) = {GEMINI_GROUNDING_MODEL}")
     print(f"DEBUG: MAX_ITEMS_PER_RUN = {MAX_ITEMS_PER_RUN} | RANKING_POOL_SIZE = {RANKING_POOL_SIZE} "
-          f"| MAX_POR_FUENTE = {MAX_POR_FUENTE}")
+          f"| MAX_POR_FUENTE = {MAX_POR_FUENTE} | MAX_POR_CATEGORIA = {MAX_POR_CATEGORIA}")
     print(f"DEBUG: MAX_FUENTES_ADICIONALES = {MAX_FUENTES_ADICIONALES} "
           f"| FUENTES_MAXIMA_AUTORIDAD = {len(FUENTES_MAXIMA_AUTORIDAD)} dominios")
     print(f"DEBUG: MAX_CATEGORIAS_RECIENTES (ventana de diversidad) = {MAX_CATEGORIAS_RECIENTES}")
     print(f"DEBUG: MAX_TEMAS_RECIENTES (ventana de dedup tematico) = {MAX_TEMAS_RECIENTES}")
+    print(f"DEBUG: SIMILITUD_DEDUP_INTERNO = {SIMILITUD_DEDUP_INTERNO} | "
+          f"SIMILITUD_DEDUP_HISTORIAL = {SIMILITUD_DEDUP_HISTORIAL}")
+    print(f"DEBUG: GENERAR_TRANSACCIONAL_CADA_N_CORRIDAS = {GENERAR_TRANSACCIONAL_CADA_N_CORRIDAS} "
+          f"| MIN_PRODUCTOS_TRANSACCIONAL = {MIN_PRODUCTOS_TRANSACCIONAL}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
     print(f"DEBUG: GOOGLE_SEARCH_ENGINE_ID {'OK' if GOOGLE_SEARCH_ENGINE_ID else 'FALTA'}")
     print(f"DEBUG: GEMINI_CALL_DELAY = {GEMINI_CALL_DELAY}s | SEARCH_CALL_DELAY = {SEARCH_CALL_DELAY}s | "
@@ -2155,14 +2588,16 @@ def main():
 
             # Registramos la categoria de esta nota en el historial de
             # diversidad, para que el proximo ranking la tenga en cuenta
-            # como criterio de desempate.
+            # como criterio de desempate (y para que el cap duro por
+            # categoria de la proxima corrida la contemple tambien).
             guardar_categoria_reciente(item.get("categoria_reglas"))
             print(f"🗂️ Categoría registrada en historial de diversidad: "
                   f"{item.get('categoria_reglas')}")
 
             # Registramos el tema (titulo + resumen) de esta nota en el
-            # historial de dedup, para que el proximo ranking de Gemini
-            # pueda descartar noticias que cubran el mismo hecho.
+            # historial de dedup, para que la proxima corrida pueda
+            # descartarla por similitud de texto (dedup determinista) y,
+            # como segunda capa, tambien via el ranking de Gemini.
             guardar_tema_reciente(item)
             print(f"🧩 Tema registrado en historial de dedup: {item['title'][:60]}")
 
@@ -2170,6 +2605,20 @@ def main():
             print(f"[ERROR] No se pudo procesar '{item['title']}': {type(e).__name__}: {e}")
 
         time.sleep(DELAY_ENTRE_ITEMS)
+
+    # --- Artículo transaccional periódico (guía de compra) ---
+    # Se genera cada GENERAR_TRANSACCIONAL_CADA_N_CORRIDAS corridas del
+    # pipeline, para no competir por rate limit con las noticias del dia.
+    contador = load_contador_corridas() + 1
+    guardar_contador_corridas(contador)
+
+    if contador % GENERAR_TRANSACCIONAL_CADA_N_CORRIDAS == 0:
+        time.sleep(DELAY_ENTRE_FASES)
+        generar_articulo_transaccional()
+    else:
+        faltan = GENERAR_TRANSACCIONAL_CADA_N_CORRIDAS - (contador % GENERAR_TRANSACCIONAL_CADA_N_CORRIDAS)
+        print(f"ℹ️ Corrida #{contador}: sin artículo transaccional esta vez "
+              f"(próximo en {faltan} corrida(s)).")
 
     print("\n✅ Pipeline finalizado.")
 
