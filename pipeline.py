@@ -2059,7 +2059,7 @@ El cuerpo de la nota en Markdown (600-900 palabras):
      directamente al keyword.
    - El keyword debe aparecer como STRING EXACTO dentro de una oracion que
      se lea 100% natural al leerla en voz alta.
-   - El keyword debe tener una densidad dentro del cuerpo de aproximadamente %1,3.
+   - El keyword debe tener una densidad dentro del cuerpo de aproximadamente %1. A veces, usar sinónimos para no hacer keyword stuffing.
 
 2. SUBTITULOS (H2) — EL KEYWORD DEBE ESTAR PRESENTE:
    - Dividi el cuerpo en al menos 3-4 subtitulos H2 (##).
