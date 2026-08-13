@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Pipeline de automatizacion para tecno.ar (Hybrid 5.0 - 5 items/corrida + cap con relleno
+Pipeline de automatizacion para tecno.ar (Hybrid 5.1 - 5 items/corrida + cap con relleno
 + historial de categorias para diversidad tematica + dedup tematico manejado por IA
 + dedup DETERMINISTICO por similitud de texto (contra historial y entre candidatos)
 + CAP DURO por categoria ademas del cap por fuente + manejo robusto de errores por item
 + cierre opcional de impacto en Argentina + señal de desempate por conexion local
 + GENERACION PERIODICA DE ARTICULOS TRANSACCIONALES (guias de compra) con datos
 verificados por busqueda en tiempo real, nunca inventados
++ EXCLUSION DURA DE CIBERSEGURIDAD Y PROGRAMACION + TOPE ESPECIAL ANTI-SESGO DE IA
 ==================================================================================
 1. Filtro rapido por reglas (gratis) -> reduce de cientos a ~20-30
 2. DEDUP DETERMINISTICO por similitud de texto: se descartan candidatos que ya
@@ -25,7 +26,10 @@ verificados por busqueda en tiempo real, nunca inventados
    periodistico) se pondera levemente una conexion local (Argentina/LatAm) real.
 4. Seleccion final con CAP DURO por fuente Y por categoria (no solo desempate):
    ninguna categoria puede ocupar mas de MAX_POR_CATEGORIA lugares de la corrida,
-   sin importar cuantos candidatos de esa categoria hayan rankeado bien.
+   sin importar cuantos candidatos de esa categoria hayan rankeado bien. La
+   categoria "ia" tiene ademas un tope ESPECIAL mas estricto (ver
+   CAP_ESPECIAL_POR_CATEGORIA), para evitar la sobrerrepresentacion que se
+   detecto en la practica (hasta 80% de las notas publicadas eran de IA).
 5. Triangulacion de fuentes: el grounding de Gemini con Google Search, restringido a
    UNA SOLA fuente de MAXIMA AUTORIDAD (ver FUENTES_MAXIMA_AUTORIDAD), es el metodo
    PRIORITARIO por su precision semantica; si no encuentra nada dentro de esa
@@ -61,6 +65,24 @@ extraccion de cada fuente adicional, y entre el procesamiento de cada item.
 El objetivo es espaciar las llamadas salientes para reducir al maximo la
 probabilidad de pegar contra un limite de cuota, no solo reaccionar cuando
 ya ocurrio.
+
+NOTA SOBRE EXCLUSION DE TEMAS: el pipeline descarta explicita y tempranamente
+(antes de cualquier scoring o triangulacion, y antes incluso de entrar al pool
+de candidatos usado para triangular otras noticias) toda noticia relacionada
+con ciberseguridad (ataques, vulnerabilidades, malware, brechas de seguridad,
+ransomware, phishing, etc.) o con programacion/desarrollo de software como
+tema en si mismo (lenguajes, frameworks, repositorios de codigo, herramientas
+para programadores), independientemente de que fuente la traiga. Ademas, los
+medios puramente de ciberseguridad fueron retirados de las fuentes de maxima
+autoridad y de los sitios de referencia usados en la triangulacion.
+
+NOTA SOBRE DIVERSIDAD Y SESGO HACIA IA: para evitar que el feed se concentre
+desproporcionadamente en noticias de Inteligencia Artificial (llegaron a
+representar hasta el 80% de las notas publicadas), se agrego un tope especial
+mas estricto para la categoria "ia" (1 sola nota de IA por corrida, en vez de
+las 2 que permite el tope general para el resto de las categorias), ademas de
+instrucciones explicitas al ranking de Gemini para que no le de preferencia
+por defecto a la categoria IA sobre el resto.
 """
 
 import feedparser
@@ -174,7 +196,10 @@ SEARCH_BASE_BACKOFF = 3
 # Medios a los que se restringe el grounding de Gemini cuando actúa como
 # metodo PRIORITARIO. Son fuentes de maxima autoridad, no el listado amplio
 # de SITIOS_REFERENCIA_BUSQUEDA (ese se sigue usando solo en la cascada de
-# respaldo con Custom Search).
+# respaldo con Custom Search). NOTA: se retiraron los medios puramente de
+# ciberseguridad (bleepingcomputer.com, thehackernews.com,
+# krebsonsecurity.com), ya que esos temas quedan excluidos del pipeline
+# (ver CIBERSEGURIDAD_KEYWORDS / es_tema_excluido).
 FUENTES_MAXIMA_AUTORIDAD = [
     "reuters.com",
     "apnews.com",
@@ -184,9 +209,6 @@ FUENTES_MAXIMA_AUTORIDAD = [
     "theverge.com",
     "wired.com",
     "arstechnica.com",
-    "bleepingcomputer.com",
-    "thehackernews.com",
-    "krebsonsecurity.com",
     "infobae.com",
     "clarin.com",
     "ambito.com",
@@ -202,6 +224,12 @@ UMBRAL_RELEVANCIA_CASCADA = 0.12
 SIMILITUD_DEDUP_INTERNO = 0.25     # dos candidatos de la MISMA corrida = mismo hecho
 SIMILITUD_DEDUP_HISTORIAL = 0.22   # candidato vs. algo ya publicado = mismo hecho
 
+# NOTA: se retiraron thehackernews.com, bleepingcomputer.com y
+# krebsonsecurity.com de este listado (medios puramente de ciberseguridad,
+# tema excluido). De paso se corrigio un bug: faltaba una coma entre
+# "reuters.com" y "anthropic.com", lo que concatenaba ambos strings en uno
+# solo invalido y hacia que "anthropic.com" nunca se usara como sitio de
+# referencia.
 SITIOS_REFERENCIA_BUSQUEDA = [
     "techcrunch.com",
     "theverge.com",
@@ -218,11 +246,8 @@ SITIOS_REFERENCIA_BUSQUEDA = [
     "blog.google",
     "news.microsoft.com",
     "openai.com",
-    "reuters.com"
+    "reuters.com",
     "anthropic.com",
-    "thehackernews.com",
-    "bleepingcomputer.com",
-    "krebsonsecurity.com",
     "9to5mac.com",
     "9to5google.com",
     "androidauthority.com",
@@ -565,6 +590,60 @@ def _google_search_con_reintentos(params, contexto=""):
     return None
 
 # ----------------------------------------------------------------------
+# EXCLUSION DURA DE TEMAS (ciberseguridad y programacion)
+# ----------------------------------------------------------------------
+# Estos dos filtros corren ANTES que cualquier otra cosa (antes del scoring
+# por reglas, antes de entrar al pool de candidatos para triangulacion, y
+# por lo tanto antes de gastar un solo token de Gemini). tecno.ar NO cubre
+# ciberseguridad (ataques, vulnerabilidades, malware, filtraciones, etc.)
+# ni programacion/desarrollo de software como tema en si mismo, sin
+# importar que tan buena sea la nota o de que feed venga.
+
+CIBERSEGURIDAD_KEYWORDS = [
+    "ciberseguridad", "cyberseguridad", "seguridad informatica",
+    "seguridad informática", "hacker", "hackers", "hackeo", "hackeado",
+    "hackeada", "ciberataque", "ciberataques", "malware", "ransomware",
+    "phishing", "vulnerabilidad", "vulnerabilidades", "exploit", "exploits",
+    "brecha de seguridad", "filtracion de datos", "filtración de datos",
+    "data breach", "cve-", "parche de seguridad", "security patch",
+    "firewall", "antivirus", "spyware", "troyano", "botnet",
+    "ataque ddos", "ddos attack", "zero-day", "zero day", "vpn",
+    # ingles
+    "cybersecurity", "cyber security", "security breach", "hacked",
+    "hacking", "cyberattack", "cyber attack", "vulnerability",
+    "data leak", "leaked data", "threat actor", "infostealer",
+    "security researcher", "penetration testing", "pentesting",
+]
+
+PROGRAMACION_KEYWORDS = [
+    "programacion", "programación", "lenguaje de programacion",
+    "lenguaje de programación", "framework de desarrollo",
+    "libreria de codigo", "librería de código", "repositorio de github",
+    "github repo", "pull request", "codigo fuente", "código fuente",
+    "desarrollador de software", "desarrolladores de software",
+    "desarrollo de software", "compilador", "depuracion de codigo",
+    "algoritmo de programacion",
+    # ingles
+    "programming language", "coding tutorial", "source code",
+    "software developer", "software development", "open source project",
+    "github repository", "npm package", "python library",
+    "javascript framework", "web development framework",
+]
+
+def es_tema_excluido(texto):
+    """
+    True si el texto (titulo + resumen) corresponde a ciberseguridad o a
+    programacion como tema en si mismo. Se usa como filtro duro apenas se
+    ingiere cada entry del RSS, antes de cualquier otro procesamiento.
+    """
+    text = texto.lower()
+    if any(kw in text for kw in CIBERSEGURIDAD_KEYWORDS):
+        return True
+    if any(kw in text for kw in PROGRAMACION_KEYWORDS):
+        return True
+    return False
+
+# ----------------------------------------------------------------------
 # DEDUP DETERMINISTICO (similitud de texto en Python, sin depender de IA)
 # ----------------------------------------------------------------------
 # Estos dos filtros corren ANTES de gastar una llamada a Gemini en el
@@ -731,7 +810,7 @@ def is_recent(entry, max_hours=MAX_HOURS_OLD):
 # ----------------------------------------------------------------------
 # Las categorias de abajo estan alineadas al menu real de tecno.ar:
 # Smartphones / Hardware / Gaming / Empresas / Ciencia / Vehiculos / Hogar /
-# Mas Tecno (Cripto, Redes, Smartwatch, Gadgets) / RA / IA / Ciberseguridad
+# Mas Tecno (Cripto, Redes, Smartwatch, Gadgets) / RA / IA
 
 LAUNCH_KEYWORDS = [
     "lanza", "lanzamiento", "presenta", "presento", "anuncia", "anuncio",
@@ -850,6 +929,14 @@ PENALTY_KEYWORDS = [
 
 def compute_relevance_score(entry_text):
     text = entry_text.lower()
+
+    # Exclusion dura: si el texto trata de ciberseguridad o programacion,
+    # se descarta sin importar que otras keywords matchee (ej. "chip",
+    # "software"). Esto corre ACA tambien, ademas del filtro temprano en
+    # fetch_new_relevant_items, como segunda linea de defensa.
+    if any(kw in text for kw in CIBERSEGURIDAD_KEYWORDS) or any(kw in text for kw in PROGRAMACION_KEYWORDS):
+        return 0, "excluido"
+
     is_launch = any(kw in text for kw in LAUNCH_KEYWORDS)
     score = 1
     categorias = []
@@ -1422,7 +1509,8 @@ def rank_with_gemini(candidatos, categorias_recientes=None, temas_recientes=None
     diversidad tematica cuando dos o mas candidatos quedan parejos en
     merito periodistico — nunca como cuota dura ni para descartar una
     noticia fuerte por su categoria. (El limite DURO por categoria se
-    aplica despues, en _seleccionar_final_con_relleno.)
+    aplica despues, en _seleccionar_final_con_relleno, con un tope
+    especial mas estricto para la categoria "ia".)
 
     temas_recientes: lista de dicts {'title', 'summary'} de las ultimas
     notas YA PUBLICADAS. A esta altura del pipeline ya corrio el dedup
@@ -1494,6 +1582,39 @@ por si alguna noticia del tope queda descartada por venir del mismo medio o
 categoría que otra mejor rankeada.
 
 ===========================================
+TEMAS QUE tecno.ar NO CUBRE (DESCARTAR SIEMPRE, sin excepcion)
+===========================================
+Ciberseguridad (ataques, vulnerabilidades, malware, filtraciones de datos,
+parches de seguridad, hacking, ransomware, phishing, etc.) y Programación /
+desarrollo de software como tema en sí mismo (lenguajes, frameworks,
+repositorios de código, herramientas para programadores) NO son categorías
+que tecno.ar cubra. Si alguna noticia de la lista trata alguno de estos
+temas, DESCARTALA de tu ranking sin importar su mérito periodístico. (Esto
+ya debería haber sido filtrado antes de llegar a vos, pero si igual aparece
+alguna, no la incluyas.)
+
+===========================================
+SESGO A EVITAR: LA IA NO ES LA CATEGORÍA POR DEFECTO
+===========================================
+tecno.ar viene mostrando una sobrerrepresentación de noticias de
+Inteligencia Artificial (llegaron a ser hasta el 80% de las notas
+publicadas). Esto NO es deseable: la IA es una categoría más, con la MISMA
+jerarquía que Hardware, Gaming, Empresas, Ciencia, Vehículos, Hogar, Cripto
+y RA/RV. Al armar tu ranking:
+- No le asignes a una noticia de IA un lugar mejor solo porque es de IA.
+- Si notás que una parte grande de los candidatos de esta corrida son de
+  IA, priorizá activamente noticias de otras categorías que tengan buen
+  mérito periodístico según los 4 ejes de abajo, en vez de amontonar varias
+  notas de IA en los primeros lugares del ranking.
+- Una noticia de IA débil (EJE 1 o EJE 4 bajos) NUNCA debe rankear por
+  encima de una noticia sólida de otra categoría solo por tratarse de IA.
+Un proceso automático va a aplicar además, después de tu ranking, un tope
+más estricto para IA que para el resto de las categorías (como mucho 1 nota
+de IA por corrida), así que tu propio orden de prioridad DENTRO de esa
+categoría es importante: si vas a poner varias notas de IA en tu ranking,
+que la mejor quede primera.
+
+===========================================
 REGLA DE ORO: NINGUNA CATEGORÍA VALE MÁS QUE OTRA POR DEFAULT
 ===========================================
 tecno.ar cubre Smartphones, Hardware, Gaming, Empresas, Ciencia, Vehículos,
@@ -1517,12 +1638,9 @@ reflexiones genéricas sobre el futuro de una tecnología.
 
 EJE 2 — IMPACTO Y ALCANCE REAL
 ¿A cuánta gente afecta, o qué tan grande es la empresa/sistema involucrado?
-Una vulnerabilidad crítica en software usado por millones, un ransomware
-que tumbó una aerolínea, o una adquisición multimillonaria tienen el MISMO
-nivel de impacto que el lanzamiento de un fabricante líder — no menos. Un
-anuncio menor de una empresa poco conocida, o un parche de una
-vulnerabilidad de bajo riesgo, tienen impacto bajo, sea cual sea su
-categoría.
+Una adquisición multimillonaria y el lanzamiento de un fabricante líder
+tienen el MISMO nivel de impacto potencial — no menos. Un anuncio menor de
+una empresa poco conocida tiene impacto bajo, sea cual sea su categoría.
 
 EJE 3 — ACTUALIDAD
 Qué tan reciente y puntual es el hecho dentro de la ventana de tiempo
@@ -1530,14 +1648,12 @@ cubierta. Más reciente y más "de hoy" puntúa mejor que algo que ya se viene
 arrastrando hace días.
 
 EJE 4 — VALOR INFORMATIVO PARA EL LECTOR
-¿Le aporta algo concreto al lector (una fecha, un riesgo de seguridad que
-debería conocer y mitigar, un producto que puede comprar, un dato
-verificable)? Se descarta siempre, sin importar el tema: opinión o análisis
-retrospectivo ("por qué X importa", "lo que aprendimos de..."), rankings y
-listicles ("top 10", "lo mejor de la semana"), reviews de productos que ya
-llevan tiempo en el mercado, y contenido educativo genérico sin un hecho
-puntual detrás — un "10 consejos para protegerte de hackers" se descarta
-exactamente igual que un "10 curiosidades sobre el universo".
+¿Le aporta algo concreto al lector (una fecha, un producto que puede
+comprar, un dato verificable)? Se descarta siempre, sin importar el tema:
+opinión o análisis retrospectivo ("por qué X importa", "lo que aprendimos
+de..."), rankings y listicles ("top 10", "lo mejor de la semana"), reviews
+de productos que ya llevan tiempo en el mercado, y contenido educativo
+genérico sin un hecho puntual detrás.
 
 ===========================================
 CÓMO SE VE UN EJE 1 ALTO EN CADA CATEGORÍA (ejemplos, no jerarquía)
@@ -1554,9 +1670,8 @@ CÓMO SE VE UN EJE 1 ALTO EN CADA CATEGORÍA (ejemplos, no jerarquía)
 
 Ejemplos de EJE 1 bajo o descarte en cualquier categoría: "Se filtran
 posibles specs del próximo iPhone" (rumor), "5 cosas que esperamos ver en
-el próximo Galaxy Unpacked" (especulación/preview), "Los ciberataques más
-comunes en 2026" (listicle genérico), "¿Podría Apple comprar Netflix?"
-(especulación sin negociación real).
+el próximo Galaxy Unpacked" (especulación/preview), "¿Podría Apple comprar
+Netflix?" (especulación sin negociación real).
 
 ===========================================
 CÓMO DECIDIR ENTRE VARIAS NOTICIAS CON PUNTAJE SIMILAR
@@ -1592,10 +1707,11 @@ parejas en mérito periodístico: en ese caso, dale prioridad en el ranking a
 la que pertenezca a una categoría menos representada en el historial
 reciente, para que el feed no se concentre siempre en las mismas 1-2
 categorías. (Ademas de este desempate blando, un proceso automatico va a
-aplicar despues un TOPE DURO de noticias por categoría sobre tu ranking, asi
-que aunque priorices varias notas de la misma categoría, no todas van a
-terminar publicandose si superan ese tope — por eso es importante que tu
-ORDEN de prioridad dentro de cada categoría sea el correcto.)
+aplicar despues un TOPE DURO de noticias por categoría sobre tu ranking (mas
+estricto para IA que para el resto), asi que aunque priorices varias notas
+de la misma categoría, no todas van a terminar publicandose si superan ese
+tope — por eso es importante que tu ORDEN de prioridad dentro de cada
+categoría sea el correcto.)
 {bloque_temas_previos}
 ===========================================
 DEDUPLICACION DENTRO DE ESTA MISMA LISTA
@@ -1669,18 +1785,31 @@ MAX_POR_FUENTE = max(1, MAX_ITEMS_PER_RUN // 2)
 # categoria hayan quedado bien rankeados por Gemini.
 MAX_POR_CATEGORIA = max(1, MAX_ITEMS_PER_RUN // 2)
 
+# Tope ESPECIAL, mas estricto, para categorias puntuales que tienden a
+# sobrerrepresentarse. Aplica ADEMAS del tope general de arriba: para
+# cualquier categoria no listada aca, se sigue usando MAX_POR_CATEGORIA.
+# Se agrego porque en la practica la categoria "ia" llego a representar
+# hasta el 80% de las notas publicadas.
+CAP_ESPECIAL_POR_CATEGORIA = {
+    "ia": 1,
+}
+
+def _max_por_categoria(categoria):
+    return CAP_ESPECIAL_POR_CATEGORIA.get(categoria, MAX_POR_CATEGORIA)
+
 def _seleccionar_final_con_relleno(ranking_priorizado):
     """
     Recorre el ranking priorizado (ya ordenado de mas a menos relevante) en
     varias pasadas, aplicando dos topes DUROS a la vez (no solo desempate):
 
-    1ra pasada: respeta MAX_POR_FUENTE (diversidad de medios) Y
-    MAX_POR_CATEGORIA (diversidad tematica) al mismo tiempo.
+    1ra pasada: respeta MAX_POR_FUENTE (diversidad de medios) Y el tope por
+    CATEGORIA (diversidad tematica, con un tope especial mas estricto para
+    "ia" via CAP_ESPECIAL_POR_CATEGORIA) al mismo tiempo.
 
     2da pasada (solo si hacen falta mas items para llegar a
-    MAX_ITEMS_PER_RUN): se relaja el tope de CATEGORIA pero se mantiene el
-    de FUENTE, para no perder un lugar si la sobrerrepresentacion es
-    tematica y no de medios.
+    MAX_ITEMS_PER_RUN): se relaja el tope de CATEGORIA (incluido el especial
+    de IA) pero se mantiene el de FUENTE, para no perder un lugar si la
+    sobrerrepresentacion es tematica y no de medios.
 
     3ra pasada (ultimo recurso): se relajan ambos topes, para nunca publicar
     menos de MAX_ITEMS_PER_RUN si hay candidatos disponibles.
@@ -1695,7 +1824,7 @@ def _seleccionar_final_con_relleno(ranking_priorizado):
         categoria = item.get("categoria_reglas", "general")
         return (
             conteo_fuente.get(fuente, 0) < MAX_POR_FUENTE
-            and conteo_categoria.get(categoria, 0) < MAX_POR_CATEGORIA
+            and conteo_categoria.get(categoria, 0) < _max_por_categoria(categoria)
         )
 
     def registrar(item):
@@ -1704,7 +1833,8 @@ def _seleccionar_final_con_relleno(ranking_priorizado):
         conteo_fuente[fuente] = conteo_fuente.get(fuente, 0) + 1
         conteo_categoria[categoria] = conteo_categoria.get(categoria, 0) + 1
 
-    # Pasada 1: respeta ambos topes (fuente y categoría) a la vez.
+    # Pasada 1: respeta ambos topes (fuente y categoría, con el tope
+    # especial de IA) a la vez.
     for item in ranking_priorizado:
         if len(seleccionados_final) >= MAX_ITEMS_PER_RUN:
             break
@@ -1714,7 +1844,8 @@ def _seleccionar_final_con_relleno(ranking_priorizado):
         else:
             descartados.append(item)
 
-    # Pasada 2: si faltan lugares, se relaja SOLO el tope de categoría.
+    # Pasada 2: si faltan lugares, se relaja SOLO el tope de categoría
+    # (incluido el especial de IA).
     if len(seleccionados_final) < MAX_ITEMS_PER_RUN and descartados:
         faltan = MAX_ITEMS_PER_RUN - len(seleccionados_final)
         print(f"    ℹ️ Faltan {faltan} noticia(s); se relaja el tope de "
@@ -1764,10 +1895,18 @@ def fetch_new_relevant_items():
                 continue
             if not is_recent(entry):
                 continue
+
+            texto_completo = entry.get("title", "") + " " + entry.get("summary", "")
+
+            # Exclusion dura y TEMPRANA: ciberseguridad y programacion nunca
+            # entran, ni siquiera al pool usado como respaldo para
+            # triangular otras noticias.
+            if es_tema_excluido(texto_completo):
+                continue
+
             if not is_relevant(entry):
                 continue
 
-            texto_completo = entry.get("title", "") + " " + entry.get("summary", "")
             score_reglas, categoria_reglas = compute_relevance_score(texto_completo)
 
             item_data = {
@@ -2479,25 +2618,29 @@ def save_draft(item, article_md, imagen_url=None):
 # ----------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando pipeline Hybrid 5.0 (5 items/corrida + cap con relleno "
-          "+ diversidad de categorias con TOPE DURO + dedup DETERMINISTICO por "
-          "similitud de texto + dedup tematico por IA como 2da capa + manejo "
-          "robusto de errores por item + grounding con 1 fuente de maxima "
-          "autoridad como metodo prioritario / Custom Search como respaldo + "
-          "esperas anti rate-limit + cierre opcional de impacto en Argentina + "
-          "articulos transaccionales periodicos con datos verificados por "
-          "busqueda)...")
+    print("🚀 Iniciando pipeline Hybrid 5.1 (5 items/corrida + cap con relleno "
+          "+ diversidad de categorias con TOPE DURO (mas estricto para IA) + "
+          "dedup DETERMINISTICO por similitud de texto + dedup tematico por IA "
+          "como 2da capa + exclusion dura de ciberseguridad/programacion + "
+          "manejo robusto de errores por item + grounding con 1 fuente de "
+          "maxima autoridad como metodo prioritario / Custom Search como "
+          "respaldo + esperas anti rate-limit + cierre opcional de impacto en "
+          "Argentina + articulos transaccionales periodicos con datos "
+          "verificados por busqueda)...")
     print(f"DEBUG: GEMINI_API_KEY {'OK' if GEMINI_API_KEY else 'FALTA'}")
     print(f"DEBUG: GEMINI_MODEL (redacción) = {GEMINI_MODEL}")
     print(f"DEBUG: GEMINI_GROUNDING_MODEL (grounding prioritario + ranking) = {GEMINI_GROUNDING_MODEL}")
     print(f"DEBUG: MAX_ITEMS_PER_RUN = {MAX_ITEMS_PER_RUN} | RANKING_POOL_SIZE = {RANKING_POOL_SIZE} "
-          f"| MAX_POR_FUENTE = {MAX_POR_FUENTE} | MAX_POR_CATEGORIA = {MAX_POR_CATEGORIA}")
+          f"| MAX_POR_FUENTE = {MAX_POR_FUENTE} | MAX_POR_CATEGORIA = {MAX_POR_CATEGORIA} "
+          f"| CAP_ESPECIAL_POR_CATEGORIA = {CAP_ESPECIAL_POR_CATEGORIA}")
     print(f"DEBUG: MAX_FUENTES_ADICIONALES = {MAX_FUENTES_ADICIONALES} "
           f"| FUENTES_MAXIMA_AUTORIDAD = {len(FUENTES_MAXIMA_AUTORIDAD)} dominios")
     print(f"DEBUG: MAX_CATEGORIAS_RECIENTES (ventana de diversidad) = {MAX_CATEGORIAS_RECIENTES}")
     print(f"DEBUG: MAX_TEMAS_RECIENTES (ventana de dedup tematico) = {MAX_TEMAS_RECIENTES}")
     print(f"DEBUG: SIMILITUD_DEDUP_INTERNO = {SIMILITUD_DEDUP_INTERNO} | "
           f"SIMILITUD_DEDUP_HISTORIAL = {SIMILITUD_DEDUP_HISTORIAL}")
+    print(f"DEBUG: exclusion dura activa para ciberseguridad ({len(CIBERSEGURIDAD_KEYWORDS)} keywords) "
+          f"y programacion ({len(PROGRAMACION_KEYWORDS)} keywords)")
     print(f"DEBUG: GENERAR_TRANSACCIONAL_CADA_N_CORRIDAS = {GENERAR_TRANSACCIONAL_CADA_N_CORRIDAS} "
           f"| MIN_PRODUCTOS_TRANSACCIONAL = {MIN_PRODUCTOS_TRANSACCIONAL}")
     print(f"DEBUG: GOOGLE_SEARCH_API_KEY {'OK' if GOOGLE_SEARCH_API_KEY else 'FALTA'}")
