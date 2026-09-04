@@ -491,10 +491,7 @@ def generate_post_image(
     # `photo` es RGBA. Se pasa también como máscara para que el
     # canal alfa se componga contra el blanco del canvas: así las
     # zonas transparentes del PNG (fondos de fotos de producto,
-    # por ejemplo) quedan blancas en vez de negras. Antes se
-    # aplanaba con `.convert("RGB")` antes de pegar, lo cual
-    # descarta el alfa sin componerlo y deja negro donde había
-    # transparencia.
+    # por ejemplo) quedan blancas en vez de negras.
     canvas.paste(
         photo,
         (0, 0),
@@ -553,18 +550,26 @@ def generate_post_image(
     )
 
     # --------------------------------------------------------
-    # Cinta azul superior
+    # Cinta azul diagonal (estilo Motorola)
+    #
+    # No es una barra horizontal: es un triángulo que nace en el
+    # borde superior del box y sube metiéndose en la foto, con un
+    # borde diagonal que baja de derecha a izquierda hasta un punto
+    # sobre el borde izquierdo del box. Medido sobre la captura de
+    # referencia de Motorola.
     # --------------------------------------------------------
 
-    ribbon_height = 16
+    ribbon_rise = 85    # cuánto sube el triángulo por encima del box, hacia la foto
+    ribbon_width = 290  # cuánto se extiende el triángulo a lo ancho del box
 
-    draw.rectangle(
-        (
-            box_left,
-            box_top,
-            box_right,
-            box_top + ribbon_height,
-        ),
+    ribbon_points = [
+        (box_left, box_top - ribbon_rise),                # arriba-izquierda
+        (box_left + ribbon_width, box_top - ribbon_rise),  # arriba-derecha
+        (box_left, box_top),                                # punta abajo, sobre el borde del box
+    ]
+
+    draw.polygon(
+        ribbon_points,
         fill=(18, 91, 211, 255),
     )
 
@@ -652,20 +657,39 @@ def generate_post_image(
         )
 
     # --------------------------------------------------------
-    # Línea inferior azul
+    # Línea inferior con degradé (estilo Motorola)
+    #
+    # No es una barra sólida: va de azul oscuro a celeste claro,
+    # de izquierda a derecha, fina y con margen respecto al borde
+    # inferior del box.
     # --------------------------------------------------------
 
     draw = ImageDraw.Draw(canvas)
 
-    draw.rectangle(
-        (
-            box_left,
-            box_bottom - 12,
-            box_right,
-            box_bottom,
-        ),
-        fill=(18, 91, 211, 255),
-    )
+    line_left = box_left + 40
+    line_right = box_right - 40
+    line_y = box_bottom - 35
+    line_height = 8
+
+    color_start = (20, 40, 140)
+    color_end = (110, 170, 245)
+
+    line_width = line_right - line_left
+
+    for i in range(line_width):
+
+        t = i / max(line_width - 1, 1)
+
+        r = int(color_start[0] + (color_end[0] - color_start[0]) * t)
+        g = int(color_start[1] + (color_end[1] - color_start[1]) * t)
+        b = int(color_start[2] + (color_end[2] - color_start[2]) * t)
+
+        x = line_left + i
+
+        draw.line(
+            [(x, line_y), (x, line_y + line_height)],
+            fill=(r, g, b, 255),
+        )
 
     # --------------------------------------------------------
     # Convertir SIEMPRE a RGB
