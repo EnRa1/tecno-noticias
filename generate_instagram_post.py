@@ -27,14 +27,19 @@ except ImportError:
 # CONFIGURACIÓN
 # ============================================================
 
+# Rutas absolutas basadas en la ubicación del script, no en el
+# directorio de trabajo del proceso que lo invoca. Así no importa
+# desde dónde se ejecute (local, GitHub Actions, etc).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 INSTAGRAM_WIDTH = 1080
 INSTAGRAM_HEIGHT = 1350
 
 OUTPUT_DIR = "instagram_posts"
 
-LOGO_PATH = os.path.join("assets", "logo.png")
+LOGO_PATH = os.path.join(BASE_DIR, "assets", "logo.png")
 
-FONT_PATH = os.path.join("assets", "Poppins-Bold.ttf")
+FONT_PATH = os.path.join(BASE_DIR, "assets", "fonts", "Poppins-Bold.ttf")
 
 JPEG_QUALITY = 90
 
@@ -318,26 +323,25 @@ def prepare_background(image):
 def load_font(size):
     """
     Carga Poppins-Bold.
+
+    Si no está disponible, se corta la ejecución en lugar de
+    degradar silenciosamente a la fuente por defecto de Pillow:
+    esa fuente ignora `size` y produce títulos ilegibles, y es
+    preferible que falle el job a que se publique así en Instagram.
     """
 
-    if os.path.exists(FONT_PATH):
+    if not os.path.exists(FONT_PATH):
+        raise RuntimeError(
+            f"No se encontró la fuente en {FONT_PATH}. "
+            "Verificá que 'assets/fonts/Poppins-Bold.ttf' exista en el "
+            "repo con ese nombre exacto (Linux distingue mayúsculas "
+            "de minúsculas)."
+        )
 
-        try:
-            return ImageFont.truetype(
-                FONT_PATH,
-                size=size,
-            )
-        except Exception as error:
-            print(
-                f"⚠️ No se pudo cargar Poppins-Bold: {error}"
-            )
-
-    print(
-        "⚠️ No se encontró Poppins-Bold.ttf. "
-        "Se utilizará una fuente alternativa."
+    return ImageFont.truetype(
+        FONT_PATH,
+        size=size,
     )
-
-    return ImageFont.load_default()
 
 
 # ============================================================
@@ -484,11 +488,17 @@ def generate_post_image(
         "white",
     )
 
-    photo_rgb = photo.convert("RGB")
-
+    # `photo` es RGBA. Se pasa también como máscara para que el
+    # canal alfa se componga contra el blanco del canvas: así las
+    # zonas transparentes del PNG (fondos de fotos de producto,
+    # por ejemplo) quedan blancas en vez de negras. Antes se
+    # aplanaba con `.convert("RGB")` antes de pegar, lo cual
+    # descarta el alfa sin componerlo y deja negro donde había
+    # transparencia.
     canvas.paste(
-        photo_rgb,
+        photo,
         (0, 0),
+        photo,
     )
 
     draw = ImageDraw.Draw(canvas)
