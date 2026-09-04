@@ -1,185 +1,800 @@
-#!/usr/bin/env python3
-"""
-Genera imágenes para Instagram con el estilo fijo de tecno.ar:
-foto de portada + logo + cinta diagonal azul + caja de título + línea degradada.
-Lo único que cambia entre posts es la foto de fondo y el título.
-"""
-
+import os
+import re
 import io
 import requests
-from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-BASE_DIR = Path(__file__).parent
-ASSETS_DIR = BASE_DIR / "assets"
-OUTPUT_DIR = BASE_DIR / "instagram_posts"
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-LOGO_PATH = ASSETS_DIR / "logo.png"
-FONT_PATH = ASSETS_DIR / "fonts" / "Poppins-Bold.ttf"
+# Soporte HEIC / HEIF
+try:
+    import pillow_heif
 
-# Lienzo formato post de feed (proporción 4:5, la que más espacio ocupa en el feed)
-CANVAS_W = 1080
-CANVAS_H = 1350
+    pillow_heif.register_heif_opener()
+    HEIF_AVAILABLE = True
+except ImportError:
+    HEIF_AVAILABLE = False
 
-PHOTO_H = 850          # alto de la zona de foto
-TITLE_BOX_H = CANVAS_H - PHOTO_H
+# Soporte SVG
+try:
+    import cairosvg
 
-COLOR_NAVY = (20, 32, 68)        # texto del título
-COLOR_BLUE_RIBBON = (30, 80, 210)
-COLOR_WHITE = (255, 255, 255)
-
-PADDING_X = 60
+    CAIROSVG_AVAILABLE = True
+except ImportError:
+    CAIROSVG_AVAILABLE = False
 
 
-def _download_image(url):
-    resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-    resp.raise_for_status()
-    return Image.open(io.BytesIO(resp.content)).convert("RGB")
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+INSTAGRAM_WIDTH = 1080
+INSTAGRAM_HEIGHT = 1350
+
+OUTPUT_DIR = "instagram_posts"
+
+LOGO_PATH = os.path.join("assets", "logo.png")
+
+FONT_PATH = os.path.join("assets", "Poppins-Bold.ttf")
+
+JPEG_QUALITY = 90
+
+REQUEST_TIMEOUT = 30
 
 
-def _cover_resize(img, target_w, target_h):
-    """Recorta y escala la imagen para que cubra el área target sin deformarse (como object-fit: cover)."""
-    src_ratio = img.width / img.height
-    target_ratio = target_w / target_h
+# ============================================================
+# UTILIDADES
+# ============================================================
 
-    if src_ratio > target_ratio:
-        new_h = target_h
-        new_w = int(new_h * src_ratio)
-    else:
-        new_w = target_w
-        new_h = int(new_w / src_ratio)
-
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-    left = (new_w - target_w) // 2
-    top = (new_h - target_h) // 2
-    return img.crop((left, top, left + target_w, top + target_h))
-
-
-def _draw_diagonal_ribbon(canvas, y_start):
-    """Dibuja la cinta triangular azul que separa la foto del cuadro de texto."""
-    draw = ImageDraw.Draw(canvas, "RGBA")
-    ribbon_w = 380
-    ribbon_h = 90
-    points = [
-        (0, y_start),
-        (ribbon_w, y_start),
-        (0, y_start + ribbon_h),
-    ]
-    draw.polygon(points, fill=COLOR_BLUE_RIBBON + (255,))
-
-
-def _draw_gradient_line(canvas, y):
-    """Línea horizontal con degradado azul, como en el template original."""
-    line_w = CANVAS_W - (PADDING_X * 2)
-    line_h = 6
-    gradient = Image.new("RGB", (line_w, line_h), COLOR_WHITE)
-    draw = ImageDraw.Draw(gradient)
-    start_color = (10, 20, 120)
-    end_color = (120, 180, 255)
-    for x in range(line_w):
-        ratio = x / line_w
-        r = int(start_color[0] + (end_color[0] - start_color[0]) * ratio)
-        g = int(start_color[1] + (end_color[1] - start_color[1]) * ratio)
-        b = int(start_color[2] + (end_color[2] - start_color[2]) * ratio)
-        draw.line([(x, 0), (x, line_h)], fill=(r, g, b))
-    canvas.paste(gradient, (PADDING_X, y))
-
-
-def _fit_title_font(draw, title, max_width, max_lines=4, start_size=64, min_size=36):
-    """Reduce el tamaño de fuente hasta que el título entre en max_lines líneas."""
-    size = start_size
-    while size >= min_size:
-        font = ImageFont.truetype(str(FONT_PATH), size)
-        lines = _wrap_text(draw, title, font, max_width)
-        if len(lines) <= max_lines:
-            return font, lines
-        size -= 2
-    # Si ni al tamaño mínimo entra, se trunca con "..."
-    font = ImageFont.truetype(str(FONT_PATH), min_size)
-    lines = _wrap_text(draw, title, font, max_width)[:max_lines]
-    if lines:
-        lines[-1] = lines[-1].rstrip() + "…"
-    return font, lines
-
-
-def _wrap_text(draw, text, font, max_width):
-    words = text.split()
-    lines = []
-    current = ""
-    for word in words:
-        trial = (current + " " + word).strip()
-        bbox = draw.textbbox((0, 0), trial, font=font)
-        if bbox[2] - bbox[0] <= max_width:
-            current = trial
-        else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-    return lines
-
-
-def generate_post_image(image_url, title, output_filename):
+def slugify(text):
     """
-    Genera el post de Instagram con el estilo fijo de tecno.ar.
-    image_url: URL de la foto de portada del artículo (viene de trafilatura, campo top_image).
-    title: el H1 del artículo generado por Gemini.
-    output_filename: nombre del archivo .png a guardar (sin ruta).
-    Devuelve el Path al archivo generado.
+    Convierte un título en un nombre de archivo seguro.
     """
-    OUTPUT_DIR.mkdir(exist_ok=True)
 
-    canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), COLOR_WHITE)
+    text = str(text or "").strip().lower()
 
-    # 1. Foto de fondo (cover-resize + leve oscurecido inferior para contraste)
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    text = re.sub(r"[\s_-]+", "-", text)
+    text = text.strip("-")
+
+    return text[:100] or "instagram-post"
+
+
+def ensure_output_dir():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ============================================================
+# DESCARGA DE IMAGEN
+# ============================================================
+
+def download_image(image_url):
+    """
+    Descarga una imagen desde una URL pública.
+
+    Soporta redirecciones y distintos formatos.
+    """
+
+    if not image_url:
+        raise ValueError("La URL de la imagen está vacía.")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/131.0 Safari/537.36"
+        ),
+        "Accept": (
+            "image/avif,image/webp,image/apng,"
+            "image/svg+xml,image/*,*/*;q=0.8"
+        ),
+    }
+
+    print(f"🖼️ Descargando imagen: {image_url}")
+
+    response = requests.get(
+        image_url,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
+    )
+
+    response.raise_for_status()
+
+    if not response.content:
+        raise ValueError("La respuesta de la imagen está vacía.")
+
+    print(
+        f"✅ Imagen descargada: "
+        f"{len(response.content) / 1024:.1f} KB"
+    )
+
+    return response.content
+
+
+# ============================================================
+# APERTURA UNIVERSAL DE IMAGEN
+# ============================================================
+
+def open_image_from_bytes(data):
+    """
+    Abre diferentes tipos de imágenes y devuelve una imagen PIL.
+
+    Soporta:
+    - JPG/JPEG
+    - PNG
+    - WEBP
+    - GIF
+    - BMP
+    - TIFF
+    - ICO
+    - HEIC/HEIF
+    - AVIF cuando Pillow lo soporte
+    - SVG mediante CairoSVG
+    """
+
+    if not data:
+        raise ValueError("No se recibieron datos de imagen.")
+
+    # --------------------------------------------------------
+    # Intento normal con Pillow
+    # --------------------------------------------------------
+
     try:
-        photo = _download_image(image_url)
-        photo = _cover_resize(photo, CANVAS_W, PHOTO_H)
-    except Exception as e:
-        print(f"⚠️ No se pudo descargar la imagen de portada ({e}), usando fondo sólido.")
-        photo = Image.new("RGB", (CANVAS_W, PHOTO_H), (30, 30, 40))
+        image = Image.open(io.BytesIO(data))
 
-    canvas.paste(photo, (0, 0))
+        # Si es animada, utilizamos el primer frame.
+        try:
+            if getattr(image, "is_animated", False):
+                image.seek(0)
+        except Exception:
+            pass
 
-    # Degradado oscuro suave en la base de la foto, para que el logo/cinta se lean bien
-    gradient_overlay = Image.new("L", (CANVAS_W, 200), 0)
-    grad_draw = ImageDraw.Draw(gradient_overlay)
-    for y in range(200):
-        alpha = int(120 * (y / 200))
-        grad_draw.line([(0, y), (CANVAS_W, y)], fill=alpha)
-    dark_layer = Image.new("RGB", (CANVAS_W, 200), (0, 0, 0))
-    canvas.paste(dark_layer, (0, PHOTO_H - 200), gradient_overlay)
+        image.load()
 
-    # 2. Logo arriba a la derecha
-    if LOGO_PATH.exists():
-        logo = Image.open(LOGO_PATH).convert("RGBA")
-        logo_w = 90
-        logo_h = int(logo.height * (logo_w / logo.width))
-        logo = logo.resize((logo_w, logo_h), Image.LANCZOS)
-        canvas.paste(logo, (CANVAS_W - logo_w - 40, 40), logo)
+        print(
+            f"✅ Formato detectado por Pillow: "
+            f"{image.format or 'desconocido'} "
+            f"{image.width}x{image.height}"
+        )
+
+        return image.copy()
+
+    except Exception as pillow_error:
+
+        # ----------------------------------------------------
+        # Intento SVG
+        # ----------------------------------------------------
+
+        if CAIROSVG_AVAILABLE:
+
+            stripped = data.lstrip()
+
+            is_svg = (
+                stripped.startswith(b"<svg")
+                or b"<svg" in stripped[:1000].lower()
+                or b"xmlns=\"http://www.w3.org/2000/svg\"" in stripped[:2000]
+            )
+
+            if is_svg:
+
+                try:
+
+                    print("🔄 Imagen SVG detectada. Convirtiendo...")
+
+                    png_data = cairosvg.svg2png(
+                        bytestring=data,
+                        output_width=INSTAGRAM_WIDTH,
+                    )
+
+                    image = Image.open(
+                        io.BytesIO(png_data)
+                    )
+
+                    image.load()
+
+                    print("✅ SVG convertido correctamente.")
+
+                    return image.copy()
+
+                except Exception as svg_error:
+                    raise ValueError(
+                        f"No se pudo procesar el SVG: {svg_error}"
+                    ) from svg_error
+
+        # ----------------------------------------------------
+        # Error final
+        # ----------------------------------------------------
+
+        raise ValueError(
+            "No se pudo abrir la imagen. "
+            f"Pillow informó: {pillow_error}"
+        ) from pillow_error
+
+
+# ============================================================
+# NORMALIZACIÓN
+# ============================================================
+
+def normalize_image(image):
+    """
+    Convierte la imagen a RGBA para poder trabajar
+    correctamente con transparencias.
+    """
+
+    # Algunos formatos pueden tener modos especiales.
+    if image.mode in ("P", "LA", "L", "CMYK", "I", "F"):
+        image = image.convert("RGBA")
+
+    elif image.mode == "RGB":
+        image = image.convert("RGBA")
+
+    elif image.mode == "RGBA":
+        pass
+
     else:
-        print("⚠️ No se encontró assets/logo.png, se omite el logo.")
+        image = image.convert("RGBA")
 
-    # 3. Cinta diagonal azul, en el borde entre foto y caja de texto
-    _draw_diagonal_ribbon(canvas, PHOTO_H - 30)
+    return image
 
-    # 4. Caja blanca de título
+
+# ============================================================
+# AJUSTE DE IMAGEN PARA INSTAGRAM
+# ============================================================
+
+def crop_to_instagram_ratio(image):
+    """
+    Recorta la imagen al formato 4:5.
+    """
+
+    target_ratio = INSTAGRAM_WIDTH / INSTAGRAM_HEIGHT
+
+    current_ratio = image.width / image.height
+
+    if abs(current_ratio - target_ratio) < 0.001:
+        return image
+
+    if current_ratio > target_ratio:
+
+        # Imagen demasiado ancha
+        new_width = int(image.height * target_ratio)
+
+        left = (image.width - new_width) // 2
+
+        image = image.crop(
+            (
+                left,
+                0,
+                left + new_width,
+                image.height,
+            )
+        )
+
+    else:
+
+        # Imagen demasiado alta
+        new_height = int(image.width / target_ratio)
+
+        top = (image.height - new_height) // 2
+
+        image = image.crop(
+            (
+                0,
+                top,
+                image.width,
+                top + new_height,
+            )
+        )
+
+    return image
+
+
+def prepare_background(image):
+    """
+    Prepara la fotografía para el diseño final.
+    """
+
+    image = normalize_image(image)
+
+    image = crop_to_instagram_ratio(image)
+
+    image = ImageOps.fit(
+        image,
+        (
+            INSTAGRAM_WIDTH,
+            INSTAGRAM_HEIGHT,
+        ),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+
+    return image
+
+
+# ============================================================
+# FUENTE
+# ============================================================
+
+def load_font(size):
+    """
+    Carga Poppins-Bold.
+    """
+
+    if os.path.exists(FONT_PATH):
+
+        try:
+            return ImageFont.truetype(
+                FONT_PATH,
+                size=size,
+            )
+        except Exception as error:
+            print(
+                f"⚠️ No se pudo cargar Poppins-Bold: {error}"
+            )
+
+    print(
+        "⚠️ No se encontró Poppins-Bold.ttf. "
+        "Se utilizará una fuente alternativa."
+    )
+
+    return ImageFont.load_default()
+
+
+# ============================================================
+# AJUSTE AUTOMÁTICO DEL TÍTULO
+# ============================================================
+
+def wrap_text(draw, text, font, max_width):
+    """
+    Divide el título en líneas según el ancho disponible.
+    """
+
+    words = str(text or "").split()
+
+    if not words:
+        return ""
+
+    lines = []
+    current_line = ""
+
+    for word in words:
+
+        candidate = (
+            f"{current_line} {word}".strip()
+        )
+
+        bbox = draw.textbbox(
+            (0, 0),
+            candidate,
+            font=font,
+        )
+
+        width = bbox[2] - bbox[0]
+
+        if width <= max_width:
+
+            current_line = candidate
+
+        else:
+
+            if current_line:
+                lines.append(current_line)
+
+            current_line = word
+
+    if current_line:
+        lines.append(current_line)
+
+    return "\n".join(lines)
+
+
+def fit_title(draw, title, max_width, max_height):
+    """
+    Encuentra automáticamente un tamaño de fuente
+    que permita colocar el título.
+    """
+
+    for size in range(64, 25, -2):
+
+        font = load_font(size)
+
+        wrapped = wrap_text(
+            draw,
+            title,
+            font,
+            max_width,
+        )
+
+        bbox = draw.multiline_textbbox(
+            (0, 0),
+            wrapped,
+            font=font,
+            spacing=8,
+        )
+
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+
+        if (
+            width <= max_width
+            and height <= max_height
+        ):
+            return font, wrapped
+
+    font = load_font(26)
+
+    return (
+        font,
+        wrap_text(
+            draw,
+            title,
+            font,
+            max_width,
+        ),
+    )
+
+
+# ============================================================
+# GENERACIÓN DEL DISEÑO
+# ============================================================
+
+def generate_post_image(
+    image_url,
+    title,
+    output_filename,
+):
+    """
+    Genera la placa de Instagram de Tecno.ar.
+
+    IMPORTANTE:
+    independientemente del formato original,
+    el resultado final SIEMPRE es JPEG RGB 1080x1350.
+    """
+
+    print("🎨 Generando imagen para Instagram...")
+
+    # --------------------------------------------------------
+    # Descargar
+    # --------------------------------------------------------
+
+    data = download_image(image_url)
+
+    # --------------------------------------------------------
+    # Abrir
+    # --------------------------------------------------------
+
+    source_image = open_image_from_bytes(data)
+
+    # --------------------------------------------------------
+    # Preparar fotografía
+    # --------------------------------------------------------
+
+    photo = prepare_background(source_image)
+
+    # --------------------------------------------------------
+    # Lienzo
+    # --------------------------------------------------------
+
+    canvas = Image.new(
+        "RGB",
+        (
+            INSTAGRAM_WIDTH,
+            INSTAGRAM_HEIGHT,
+        ),
+        "white",
+    )
+
+    photo_rgb = photo.convert("RGB")
+
+    canvas.paste(
+        photo_rgb,
+        (0, 0),
+    )
+
     draw = ImageDraw.Draw(canvas)
-    max_text_width = CANVAS_W - (PADDING_X * 2)
-    font, lines = _fit_title_font(draw, title, max_text_width)
 
-    line_height = int(font.size * 1.3)
-    text_block_height = line_height * len(lines)
-    text_y = PHOTO_H + ((TITLE_BOX_H - 60 - text_block_height) // 2)
+    # --------------------------------------------------------
+    # Overlay suave sobre la parte inferior
+    # --------------------------------------------------------
 
-    for i, line in enumerate(lines):
-        draw.text((PADDING_X, text_y + i * line_height), line, font=font, fill=COLOR_NAVY)
+    overlay = Image.new(
+        "RGBA",
+        canvas.size,
+        (0, 0, 0, 0),
+    )
 
-    # 5. Línea con degradado, cerca del borde inferior
-    _draw_gradient_line(canvas, CANVAS_H - 40)
+    overlay_draw = ImageDraw.Draw(overlay)
 
-    output_path = OUTPUT_DIR / output_filename
-    canvas.save(output_path, "PNG", quality=95)
-    print(f"✅ Imagen de Instagram generada: {output_path}")
-    return output_path
+    overlay_draw.rectangle(
+        (
+            0,
+            850,
+            INSTAGRAM_WIDTH,
+            INSTAGRAM_HEIGHT,
+        ),
+        fill=(0, 0, 0, 125),
+    )
+
+    canvas = Image.alpha_composite(
+        canvas.convert("RGBA"),
+        overlay,
+    )
+
+    draw = ImageDraw.Draw(canvas)
+
+    # --------------------------------------------------------
+    # Caja blanca del título
+    # --------------------------------------------------------
+
+    box_left = 55
+    box_right = INSTAGRAM_WIDTH - 55
+    box_top = 885
+    box_bottom = 1265
+
+    draw.rounded_rectangle(
+        (
+            box_left,
+            box_top,
+            box_right,
+            box_bottom,
+        ),
+        radius=28,
+        fill=(255, 255, 255, 245),
+    )
+
+    # --------------------------------------------------------
+    # Cinta azul superior
+    # --------------------------------------------------------
+
+    ribbon_height = 16
+
+    draw.rectangle(
+        (
+            box_left,
+            box_top,
+            box_right,
+            box_top + ribbon_height,
+        ),
+        fill=(18, 91, 211, 255),
+    )
+
+    # --------------------------------------------------------
+    # Título
+    # --------------------------------------------------------
+
+    title_max_width = (
+        box_right - box_left - 70
+    )
+
+    title_max_height = 285
+
+    font, wrapped_title = fit_title(
+        draw,
+        title,
+        title_max_width,
+        title_max_height,
+    )
+
+    title_x = box_left + 35
+    title_y = box_top + 48
+
+    draw.multiline_text(
+        (
+            title_x,
+            title_y,
+        ),
+        wrapped_title,
+        font=font,
+        fill=(20, 27, 45, 255),
+        spacing=8,
+    )
+
+    # --------------------------------------------------------
+    # Logo
+    # --------------------------------------------------------
+
+    if os.path.exists(LOGO_PATH):
+
+        try:
+
+            logo = Image.open(
+                LOGO_PATH
+            ).convert("RGBA")
+
+            # Tamaño máximo del logo
+            max_logo_width = 240
+            max_logo_height = 100
+
+            logo.thumbnail(
+                (
+                    max_logo_width,
+                    max_logo_height,
+                ),
+                Image.Resampling.LANCZOS,
+            )
+
+            logo_x = (
+                INSTAGRAM_WIDTH
+                - logo.width
+                - 50
+            )
+
+            logo_y = 40
+
+            canvas.alpha_composite(
+                logo,
+                (
+                    logo_x,
+                    logo_y,
+                ),
+            )
+
+        except Exception as error:
+
+            print(
+                f"⚠️ No se pudo cargar el logo: {error}"
+            )
+
+    else:
+
+        print(
+            f"⚠️ No existe el logo: {LOGO_PATH}"
+        )
+
+    # --------------------------------------------------------
+    # Línea inferior azul
+    # --------------------------------------------------------
+
+    draw = ImageDraw.Draw(canvas)
+
+    draw.rectangle(
+        (
+            box_left,
+            box_bottom - 12,
+            box_right,
+            box_bottom,
+        ),
+        fill=(18, 91, 211, 255),
+    )
+
+    # --------------------------------------------------------
+    # Convertir SIEMPRE a RGB
+    # --------------------------------------------------------
+
+    final_image = canvas.convert("RGB")
+
+    # --------------------------------------------------------
+    # Asegurar 1080x1350
+    # --------------------------------------------------------
+
+    if final_image.size != (
+        INSTAGRAM_WIDTH,
+        INSTAGRAM_HEIGHT,
+    ):
+
+        final_image = final_image.resize(
+            (
+                INSTAGRAM_WIDTH,
+                INSTAGRAM_HEIGHT,
+            ),
+            Image.Resampling.LANCZOS,
+        )
+
+    # --------------------------------------------------------
+    # Asegurar extensión JPG
+    # --------------------------------------------------------
+
+    root, _ = os.path.splitext(
+        output_filename
+    )
+
+    if not root:
+        root = output_filename
+
+    output_filename = (
+        root + ".jpg"
+    )
+
+    # --------------------------------------------------------
+    # Guardar JPEG REAL
+    # --------------------------------------------------------
+
+    ensure_output_dir()
+
+    final_image.save(
+        output_filename,
+        format="JPEG",
+        quality=JPEG_QUALITY,
+        optimize=True,
+        progressive=True,
+    )
+
+    # --------------------------------------------------------
+    # Validación
+    # --------------------------------------------------------
+
+    with Image.open(
+        output_filename
+    ) as validation:
+
+        if validation.format != "JPEG":
+            raise RuntimeError(
+                "ERROR: el archivo generado no es JPEG."
+            )
+
+        if validation.mode != "RGB":
+            raise RuntimeError(
+                "ERROR: el JPEG generado no está en RGB."
+            )
+
+        if validation.size != (
+            INSTAGRAM_WIDTH,
+            INSTAGRAM_HEIGHT,
+        ):
+            raise RuntimeError(
+                "ERROR: dimensiones incorrectas."
+            )
+
+    file_size = (
+        os.path.getsize(output_filename)
+        / 1024
+    )
+
+    print(
+        "✅ Imagen Instagram generada:"
+    )
+
+    print(
+        f"   Archivo: {output_filename}"
+    )
+
+    print(
+        f"   Formato: JPEG RGB"
+    )
+
+    print(
+        f"   Dimensiones: "
+        f"{INSTAGRAM_WIDTH}x{INSTAGRAM_HEIGHT}"
+    )
+
+    print(
+        f"   Tamaño: {file_size:.1f} KB"
+    )
+
+    return output_filename
+
+
+# ============================================================
+# EJECUCIÓN DIRECTA
+# ============================================================
+
+if __name__ == "__main__":
+
+    import sys
+
+    if len(sys.argv) < 3:
+
+        print(
+            "Uso:"
+        )
+
+        print(
+            "python generate_instagram_post.py "
+            "\"URL_IMAGEN\" \"TITULO\""
+        )
+
+        sys.exit(1)
+
+    image_url = sys.argv[1]
+    title = sys.argv[2]
+
+    filename = os.path.join(
+        OUTPUT_DIR,
+        f"{slugify(title)}.jpg",
+    )
+
+    generate_post_image(
+        image_url,
+        title,
+        filename,
+    )
